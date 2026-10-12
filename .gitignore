@@ -1,0 +1,9 @@
+/target/
+/dist/
+/tools/req/
+/tools/_to_delete/
+/tools/bak/
+/tools/*.bmp
+/tools/*.png
+/tools/*.log
+/tools/*.tgz

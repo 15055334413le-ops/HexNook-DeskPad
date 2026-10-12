@@ -1,0 +1,36 @@
+[package]
+name = "deskpad-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "DeskPad"
+path = "src/main.rs"
+
+[dependencies]
+deskpad-engine = { path = "../engine" }
+windows = { version = "=0.58.0", features = [
+  "Win32_Foundation",
+  "Foundation_Numerics",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_SystemInformation",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_System_Time",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_Ime",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }

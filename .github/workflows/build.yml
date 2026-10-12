@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --release --locked -- -D warnings
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path crates/app/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist/pkg/DeskPad | Out-Null
+          Copy-Item target/release/DeskPad.exe dist/pkg/DeskPad/
+          Copy-Item packaging/README.txt "dist/pkg/DeskPad/使用说明.txt"
+          Compress-Archive -Path dist/pkg/DeskPad -DestinationPath "dist/DeskPad-$ver-win-x64.zip" -Force
+          Copy-Item target/release/HN-DeskPad-Setup.exe dist/
+          Get-FileHash dist/*.zip, dist/*.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content dist/SHA256SUMS.txt
+          Remove-Item -Recurse dist/pkg
+          Get-Content dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hn-deskpad-win-x64
+          path: dist/*
+          retention-days: 30
