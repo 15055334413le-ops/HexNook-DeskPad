@@ -14,6 +14,8 @@ const CMD_OPEN: u32 = 1;
 const CMD_SETTINGS: u32 = 2;
 const CMD_AUTOSTART: u32 = 3;
 const CMD_EXIT: u32 = 4;
+/// 「更新到 x.y.z」：只在发现新版本时追加（动态 id，不与固定项冲突）。
+const CMD_UPDATE: u32 = 5;
 
 pub fn add(factory: &ID2D1Factory, hwnd: HWND, dpi: u32) -> Result<()> {
     let icon = glyph::tray_icon(factory, dpi)?;
@@ -103,7 +105,14 @@ pub fn on_tray_event(hwnd: HWND, lparam: LPARAM) {
 }
 
 fn popup_menu(hwnd: HWND, pt: POINT) {
-    let autostart = with_app(|a| a.eng.settings().autostart).unwrap_or(false);
+    let (autostart, new_ver) = with_app(|a| {
+        let v = match &a.update {
+            crate::update_ui::UpdateState::New(v) => Some(v.clone()),
+            _ => None,
+        };
+        (a.eng.settings().autostart, v)
+    })
+    .unwrap_or((false, None));
     // SAFETY: 菜单句柄由 HMenuGuard 管理。
     let menu = unsafe { CreatePopupMenu() }.unwrap_or_default();
     if menu.is_invalid() {
@@ -114,6 +123,11 @@ fn popup_menu(hwnd: HWND, pt: POINT) {
     unsafe {
         let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN as usize, w!("打开启动台"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS as usize, w!("设置…"));
+        // 发现新版本时在「设置…」下面加一项「更新到 x.y.z」（#35；气泡仍只有热键冲突/启动失败两种）
+        if let Some(v) = &new_ver {
+            let label = crate::win::to_wide(&format!("更新到 {v}"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_UPDATE as usize, windows::core::PCWSTR(label.as_ptr()));
+        }
         let flag = MF_STRING | if autostart { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, flag, CMD_AUTOSTART as usize, w!("开机自启"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -135,6 +149,7 @@ fn popup_menu(hwnd: HWND, pt: POINT) {
         match cmd.0 as u32 {
             CMD_OPEN => { with_app(|a| crate::pad::toggle(a, crate::app::ShowReason::Tray)); }
             CMD_SETTINGS => { let _ = crate::settings_ui::open(hwnd); }
+            CMD_UPDATE => { crate::update_ui::apply_update(); }
             CMD_AUTOSTART => {
                 crate::app::with_app(|a| {
                     let mut s = a.eng.settings();

@@ -10,7 +10,10 @@ mod ui;
 use std::path::PathBuf;
 use windows::core::{w, HSTRING};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK,
+    MB_YESNO,
+};
 
 fn main() {
     // SAFETY: 主线程首次初始化 COM（STA：文件夹选择对话框、快捷方式）。
@@ -21,7 +24,21 @@ fn main() {
         run_uninstall(quiet);
         return;
     }
+    // --update <dir>：DeskPad 自调用（从 %TEMP% 启动的副本）。界面与安装一致，
+    // 但直接进入进度阶段，不动快捷方式和开机自启（questions.md #35）。
+    if let Some(dir) = arg_after(&args, "--update") {
+        ui::run_update(&dir);
+        return;
+    }
     ui::run();
+}
+
+fn arg_after(args: &[String], flag: &str) -> Option<PathBuf> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 fn run_uninstall(quiet: bool) {

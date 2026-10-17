@@ -35,6 +35,7 @@ jobs:
           $ver = (Select-String -Path crates/app/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           New-Item -ItemType Directory -Force dist/pkg/DeskPad | Out-Null
           Copy-Item target/release/DeskPad.exe dist/pkg/DeskPad/
+          Copy-Item target/release/HN-DeskPad-Setup.exe dist/pkg/DeskPad/uninstall.exe
           Copy-Item packaging/README.txt "dist/pkg/DeskPad/使用说明.txt"
           Compress-Archive -Path dist/pkg/DeskPad -DestinationPath "dist/DeskPad-$ver-win-x64.zip" -Force
           Copy-Item target/release/HN-DeskPad-Setup.exe dist/

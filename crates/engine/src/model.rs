@@ -147,6 +147,9 @@ pub struct Settings {
     pub files_view: ViewMode,
     /// 常用文件夹的显示方式。
     pub dirs_view: ViewMode,
+    /// 打开启动台时自动检查更新（距上次 ≥24 小时才真正发起；questions.md #35）。
+    /// serde default = true，旧 config.json 缺这个字段也能读。
+    pub auto_check_update: bool,
 }
 
 impl Default for Settings {
@@ -160,6 +163,7 @@ impl Default for Settings {
             first_run_done: false,
             files_view: ViewMode::Grid,
             dirs_view: ViewMode::Grid,
+            auto_check_update: true,
         }
     }
 }

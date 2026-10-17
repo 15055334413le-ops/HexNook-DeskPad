@@ -11,6 +11,9 @@ pub const WM_APP_SNAPSHOT: u32 = WM_APP + 2;
 pub const WM_APP_SETTINGS: u32 = WM_APP + 4;
 /// 安装/卸载程序请求正常退出（等同托盘「退出」），以便替换 exe 时不留托盘残影。
 pub const WM_APP_QUIT: u32 = WM_APP + 5;
+/// 检查更新的子进程写完 update.json 后投给主窗口（engine/src/update.rs 的
+/// `--check-update` 模式）。主进程收到后刷新齿轮角标 / 托盘菜单 / 设置窗口。
+pub const WM_APP_UPDATE: u32 = WM_APP + 6;
 /// WM_MOUSELEAVE 在 windows crate 里属于 Win32_UI_Controls feature，这里直接定义常量，免得为一个常量多开 feature。
 pub const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -108,6 +111,8 @@ pub struct App {
     pub error: Option<(String, std::time::Instant)>,
     /// 已退出标志（防止 PostQuitMessage 后重复清理）。
     pub quitting: bool,
+    /// 更新状态（齿轮角标 / 托盘菜单 / 设置窗口三处共用）。
+    pub update: crate::update_ui::UpdateState,
     /// 本地时区偏移（秒）：本地时间 = Unix 时间 + tz_offset。
     pub tz_offset: i64,
     /// 当前的本地时间（呼出时取一次，用于相对时间格式化）。

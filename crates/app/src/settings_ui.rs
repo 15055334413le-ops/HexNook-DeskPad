@@ -21,7 +21,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 主体尺寸（DIP，不含阴影边距）。
 const W: f32 = 420.0;
-const H: f32 = 320.0;
+/// v0.2 起高 368：新增「更新」一行（版本 + 状态 + 按钮 / 自动检查勾选）。
+const H: f32 = 368.0;
 const LABEL_X: f32 = 24.0;
 const CTRL_X: f32 = 136.0;
 const HEADER_H: f32 = 48.0;
@@ -30,6 +31,10 @@ const HEADER_H: f32 = 48.0;
 enum Ctl {
     Radio(usize), // HotkeyPreset::ALL 下标
     CheckAuto,
+    /// 「更新」行的「自动检查更新」勾选。
+    CheckUpdate,
+    /// 「更新」行右侧按钮：没有新版本时是次按钮「检查更新」，有新版本时是主按钮「立即更新」。
+    BtnUpdate,
     BtnReplay,
     BtnCancel,
     BtnSave,
@@ -37,11 +42,13 @@ enum Ctl {
 }
 
 /// Tab 顺序（CloseX 不参与 Tab）。
-const TAB_ORDER: [Ctl; 7] = [
+const TAB_ORDER: [Ctl; 9] = [
     Ctl::Radio(0),
     Ctl::Radio(1),
     Ctl::Radio(2),
     Ctl::CheckAuto,
+    Ctl::CheckUpdate,
+    Ctl::BtnUpdate,
     Ctl::BtnReplay,
     Ctl::BtnCancel,
     Ctl::BtnSave,
@@ -53,7 +60,10 @@ fn ctl_rect(c: Ctl) -> D2D_RECT_F {
     match c {
         Ctl::Radio(i) => r(CTRL_X, 62.0 + i as f32 * 26.0, 240.0, 22.0),
         Ctl::CheckAuto => r(CTRL_X, 184.0, 240.0, 22.0),
-        Ctl::BtnReplay => r(CTRL_X, 216.0, 120.0, 28.0),
+        // 「更新」一行：勾选 + 右侧按钮（100×32，与保存同宽）
+        Ctl::CheckUpdate => r(CTRL_X, 216.0, 240.0, 22.0),
+        Ctl::BtnUpdate => r(W - 24.0 - 100.0, 246.0, 100.0, 32.0),
+        Ctl::BtnReplay => r(CTRL_X, 290.0, 120.0, 28.0),
         Ctl::BtnCancel => r(W - 24.0 - 100.0 - 12.0 - 80.0, H - 46.0, 80.0, 32.0),
         Ctl::BtnSave => r(W - 24.0 - 100.0, H - 46.0, 100.0, 32.0),
         Ctl::CloseX => r(W - 40.0, 12.0, 24.0, 24.0),
@@ -80,6 +90,8 @@ struct State {
     ctx: Option<RenderCtx>,
     hotkey_idx: usize,
     autostart: bool,
+    auto_update: bool,
+    update_state: crate::update_ui::UpdateState,
     replay: bool,
     hover: Option<Ctl>,
     pressed: Option<Ctl>,
@@ -87,6 +99,21 @@ struct State {
     err: Option<String>,
     /// 拖动标题栏：按下时鼠标相对窗口左上角的偏移（物理像素）。
     drag: Option<(i32, i32)>,
+}
+
+/// 检查更新的子进程写完后由 WM_APP_UPDATE 调用：更新状态并重绘。
+pub fn set_update_state(hwnd: HWND, state: crate::update_ui::UpdateState) {
+    let changed = S.with_borrow_mut(|s| {
+        let Some(st) = s.as_mut() else { return false };
+        if st.hwnd != hwnd {
+            return false;
+        }
+        st.update_state = state;
+        true
+    });
+    if changed {
+        redraw();
+    }
 }
 
 thread_local! {
@@ -151,6 +178,8 @@ pub fn open(_main: HWND) -> Result<()> {
             ctx: None,
             hotkey_idx,
             autostart: s.autostart,
+            auto_update: s.auto_check_update,
+            update_state: crate::update_ui::state_from(&deskpad_engine::update::load()),
             replay: false,
             hover: None,
             pressed: None,
@@ -179,8 +208,8 @@ fn close() {
 
 /// 保存：热键 → 设置 → 引导气泡；热键冲突时留在窗口上显示错误。
 fn save() {
-    let Some((hk_idx, autostart, replay)) = S.with_borrow(|s| {
-        s.as_ref().map(|st| (st.hotkey_idx, st.autostart, st.replay))
+    let Some((hk_idx, autostart, auto_update, replay)) = S.with_borrow(|s| {
+        s.as_ref().map(|st| (st.hotkey_idx, st.autostart, st.auto_update, st.replay))
     }) else {
         return;
     };
@@ -194,6 +223,7 @@ fn save() {
             s.hotkey = new_hk;
         }
         s.autostart = autostart;
+        s.auto_check_update = auto_update;
         if replay {
             s.first_run_done = false;
         }
@@ -255,6 +285,8 @@ fn draw(st: &mut State) -> Result<()> {
     let view = View {
         hotkey_idx: st.hotkey_idx,
         autostart: st.autostart,
+        auto_update: st.auto_update,
+        update_state: st.update_state.clone(),
         replay: st.replay,
         hover: st.hover,
         pressed: st.pressed,
@@ -271,6 +303,8 @@ fn draw(st: &mut State) -> Result<()> {
 struct View {
     hotkey_idx: usize,
     autostart: bool,
+    auto_update: bool,
+    update_state: crate::update_ui::UpdateState,
     replay: bool,
     hover: Option<Ctl>,
     pressed: Option<Ctl>,
@@ -313,7 +347,7 @@ fn draw_inner(ctx: &mut RenderCtx, factory: &ID2D1Factory, rt: &ID2D1RenderTarge
     fill_smooth_rect(factory, &mut ctx.geo, rt, rect(0.0, HEADER_H, W, 1.0), 0.0, ctx.pal.get(BORDER)?)?;
 
     // 左侧标签
-    for (label, y) in [("快捷键", 62.0), ("开机自启", 184.0), ("首次引导", 216.0)] {
+    for (label, y) in [("快捷键", 62.0), ("开机自启", 184.0), ("更新", 216.0), ("首次引导", 290.0)] {
         text(rt, &ctx.f_body, label, rect(LABEL_X, y, CTRL_X - LABEL_X - 8.0, 22.0), ctx.pal.get(TEXT_PRIMARY)?);
     }
 
@@ -342,26 +376,11 @@ fn draw_inner(ctx: &mut RenderCtx, factory: &ID2D1Factory, rt: &ID2D1RenderTarge
 
     // 勾选框
     {
-        let (c, checked, label) = (Ctl::CheckAuto, v.autostart, "开机时自动启动");
-        let r = at(ctl_rect(c));
-        let cy = (r.top + r.bottom) / 2.0;
-        let b = D2D_RECT_F { left: r.left, top: cy - 8.0, right: r.left + 16.0, bottom: cy + 8.0 };
-        fill_smooth_rect(factory, &mut ctx.geo, rt, b, 4.0, ctx.pal.get(if checked { PRIMARY } else { INPUT })?)?;
-        if checked {
-            // 白色对勾
-            let brush = ctx.pal.get(INPUT)?;
-            // SAFETY: 画刷有效；两段线组成对勾。
-            unsafe {
-                rt.DrawLine(D2D_POINT_2F { x: b.left + 3.5, y: cy + 0.5 }, D2D_POINT_2F { x: b.left + 6.5, y: cy + 3.5 }, brush, 1.6, None);
-                rt.DrawLine(D2D_POINT_2F { x: b.left + 6.5, y: cy + 3.5 }, D2D_POINT_2F { x: b.left + 12.5, y: cy - 3.0 }, brush, 1.6, None);
-            }
-        } else {
-            let border = if v.hover == Some(c) { BORDER_HOVER } else { BORDER };
-            draw_smooth_rect(factory, &mut ctx.geo, rt, b, 4.0, ctx.pal.get(border)?, 1.0)?;
-        }
-        let tr = D2D_RECT_F { left: r.left + 24.0, top: r.top, right: r.right, bottom: r.bottom };
-        text(rt, &ctx.f_body, label, tr, ctx.pal.get(TEXT_PRIMARY)?);
+        checkbox(ctx, factory, rt, Ctl::CheckAuto, v.autostart, "开机时自动启动", v)?;
     }
+
+    // 「更新」一行：左 = 当前版本 + 状态；右 = 检查更新 / 立即更新按钮；下方 = 自动检查勾选
+    draw_update_row(ctx, factory, rt, v)?;
 
     secondary_btn(ctx, factory, rt, Ctl::BtnReplay, if v.replay { "将重新显示 ✓" } else { "重新显示引导" }, v, v.replay)?;
 
@@ -412,11 +431,120 @@ fn secondary_btn(
     Ok(())
 }
 
+/// 勾选框 + 右侧标签（开机自启 / 自动检查更新共用）。
+fn checkbox(
+    ctx: &mut RenderCtx,
+    factory: &ID2D1Factory,
+    rt: &ID2D1RenderTarget,
+    c: Ctl,
+    checked: bool,
+    label: &str,
+    v: &View,
+) -> Result<()> {
+    let r = at(ctl_rect(c));
+    let cy = (r.top + r.bottom) / 2.0;
+    let b = D2D_RECT_F { left: r.left, top: cy - 8.0, right: r.left + 16.0, bottom: cy + 8.0 };
+    fill_smooth_rect(factory, &mut ctx.geo, rt, b, 4.0, ctx.pal.get(if checked { PRIMARY } else { INPUT })?)?;
+    if checked {
+        // 白色对勾
+        let brush = ctx.pal.get(INPUT)?;
+        // SAFETY: 画刷有效；两段线组成对勾。
+        unsafe {
+            rt.DrawLine(D2D_POINT_2F { x: b.left + 3.5, y: cy + 0.5 }, D2D_POINT_2F { x: b.left + 6.5, y: cy + 3.5 }, brush, 1.6, None);
+            rt.DrawLine(D2D_POINT_2F { x: b.left + 6.5, y: cy + 3.5 }, D2D_POINT_2F { x: b.left + 12.5, y: cy - 3.0 }, brush, 1.6, None);
+        }
+    } else {
+        let border = if v.hover == Some(c) { BORDER_HOVER } else { BORDER };
+        draw_smooth_rect(factory, &mut ctx.geo, rt, b, 4.0, ctx.pal.get(border)?, 1.0)?;
+    }
+    let tr = D2D_RECT_F { left: r.left + 24.0, top: r.top, right: r.right, bottom: r.bottom };
+    text(rt, &ctx.f_body, label, tr, ctx.pal.get(TEXT_PRIMARY)?);
+    Ok(())
+}
+
+/// 「更新」一行（y 216..278）：左上是「当前版本 + 状态」，右侧是按钮，左下是自动检查勾选。
+/// 出错信息用 TEXT_SECONDARY 小字（卡片 UI 规则：错误不抢主色）。
+fn draw_update_row(
+    ctx: &mut RenderCtx,
+    factory: &ID2D1Factory,
+    rt: &ID2D1RenderTarget,
+    v: &View,
+) -> Result<()> {
+    // 第一行：「当前 0.2.0」 + 状态文案
+    let row_y = 216.0;
+    text(
+        rt,
+        &ctx.f_body,
+        &format!("当前 {}", deskpad_engine::update::CURRENT_VERSION),
+        rect(CTRL_X, row_y, 120.0, 22.0),
+        ctx.pal.get(TEXT_PRIMARY)?,
+    );
+    let (status, status_color, secondary_font) = match &v.update_state {
+        crate::update_ui::UpdateState::Unknown => (String::new(), TEXT_SECONDARY, true),
+        crate::update_ui::UpdateState::Checking => ("正在检查…".into(), TEXT_SECONDARY, true),
+        crate::update_ui::UpdateState::Latest => ("已是最新".into(), TEXT_SECONDARY, true),
+        crate::update_ui::UpdateState::New(ver) => (format!("发现新版本 {ver}"), TEXT_PRIMARY, false),
+        crate::update_ui::UpdateState::Failed(e) => (format!("检查失败：{e}"), TEXT_SECONDARY, true),
+    };
+    if !status.is_empty() {
+        let fmt = if secondary_font { &ctx.f_small } else { &ctx.f_body };
+        text(
+            rt,
+            fmt,
+            &status,
+            rect(CTRL_X + 128.0, row_y + (if secondary_font { 3.0 } else { 0.0 }), W - CTRL_X - 24.0, 22.0),
+            ctx.pal.get(status_color)?,
+        );
+    }
+
+    // 右侧按钮：没有新版本 → 次按钮「检查更新」；有新版本 → 主按钮「立即更新」
+    let has_new = v.update_state.has_new();
+    let label = if has_new { "立即更新" } else { "检查更新" };
+    if has_new {
+        let b = at(ctl_rect(Ctl::BtnUpdate));
+        let col = if v.pressed == Some(Ctl::BtnUpdate) {
+            PRIMARY_PRESSED
+        } else if v.hover == Some(Ctl::BtnUpdate) {
+            PRIMARY_HOVER
+        } else {
+            PRIMARY
+        };
+        fill_smooth_rect(factory, &mut ctx.geo, rt, b, RADIUS_INPUT, ctx.pal.get(col)?)?;
+        text(rt, &ctx.f_body_c, label, b, ctx.pal.get(INPUT)?);
+    } else {
+        // 检查中按钮禁用态：只画框，hover/按下都不响应（After 里也会拦）
+        let checking = matches!(v.update_state, crate::update_ui::UpdateState::Checking);
+        secondary_btn(
+            ctx,
+            factory,
+            rt,
+            Ctl::BtnUpdate,
+            if checking { "正在检查…" } else { label },
+            v,
+            false,
+        )?;
+    }
+
+    // 第二行：「自动检查更新」勾选
+    checkbox(
+        ctx,
+        factory,
+        rt,
+        Ctl::CheckUpdate,
+        v.auto_update,
+        "自动检查更新",
+        v,
+    )?;
+    Ok(())
+}
+
 /// 点击/空格触发控件。返回要在借用之外执行的动作。
 enum After {
     Redraw,
     Close,
     Save,
+    /// 点「检查更新」/「立即更新」。
+    Update,
 }
 
 fn activate(st: &mut State, c: Ctl) -> After {
@@ -429,6 +557,24 @@ fn activate(st: &mut State, c: Ctl) -> After {
         Ctl::CheckAuto => {
             st.autostart = !st.autostart;
             After::Redraw
+        }
+        Ctl::CheckUpdate => {
+            st.auto_update = !st.auto_update;
+            After::Redraw
+        }
+        Ctl::BtnUpdate => {
+            st.err = None;
+            if st.update_state.has_new() {
+                // 有新版本：直接用安装程序自更新（或打开发布仓库）
+                crate::update_ui::apply_update();
+                After::Close
+            } else if matches!(st.update_state, crate::update_ui::UpdateState::Checking) {
+                // 检查中的按钮不响应重复点击（同一时刻只允许一个子进程）
+                After::Redraw
+            } else {
+                st.update_state = crate::update_ui::UpdateState::Checking;
+                After::Update
+            }
         }
         Ctl::BtnReplay => {
             st.replay = !st.replay;
@@ -444,6 +590,11 @@ fn run(after: Option<After>) {
         Some(After::Redraw) => redraw(),
         Some(After::Close) => close(),
         Some(After::Save) => save(),
+        Some(After::Update) => {
+            // 先重绘（显示「正在检查…」），再拉起一次性子进程
+            redraw();
+            crate::update_ui::check_now();
+        }
         None => {}
     }
 }

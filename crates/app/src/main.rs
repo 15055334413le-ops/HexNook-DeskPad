@@ -18,12 +18,14 @@ mod shot;
 mod smooth;
 mod surface;
 mod theme;
+mod update_ui;
 mod tray;
 mod win;
 mod winmain;
 
 use app::{set_app, with_app, App};
 use deskpad_engine::{EngineHandle, EngineError};
+use update_ui::UpdateState;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -42,10 +44,15 @@ fn fatal(msg: &str) {
 }
 
 fn main() {
-    // 0. PDF 缩略图一次性子进程：渲染完就退出，不建窗口、不碰单实例锁（engine docthumb.rs）
+    // 0. (a) PDF 缩略图一次性子进程：渲染完就退出，不建窗口、不碰单实例锁（engine docthumb.rs）
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("--thumb-pdf") {
         std::process::exit(deskpad_engine::thumb_pdf_worker(&argv[2..]));
+    }
+    // 0. (b) 检查更新的一次性子进程：读清单 → 写 update.json → 通知主进程 → 退出。
+    // WinINet 只在这个进程里被加载（engine/src/update.rs，questions.md #35）。
+    if argv.get(1).map(String::as_str) == Some("--check-update") {
+        std::process::exit(deskpad_engine::update::check_update_worker());
     }
     // 1. DPI 感知：必须在创建任何窗口之前
     // SAFETY: 进程级 DPI 声明，重复调用失败可忽略。
@@ -162,6 +169,7 @@ fn main() {
         corner_pos: None,
         error: None,
         quitting: false,
+        update: UpdateState::Unknown,
         tz_offset: 0,
         now_local: fmt::LocalNow { year: 2026, month: 1, day: 1, hour: 0, minute: 0 },
     });

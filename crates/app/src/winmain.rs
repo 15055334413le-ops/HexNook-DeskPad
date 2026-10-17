@@ -1,5 +1,6 @@
 //! 隐藏主窗口：消息路由（UI 文档 6.2）。注意：必须是普通顶层窗口（收 TaskbarCreated 广播），从不显示。
 use crate::app::{with_app, HideReason, ShowReason};
+use crate::update_ui;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::RemoteDesktop::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -38,6 +39,11 @@ pub unsafe extern "system" fn main_proc(
         }
         m if m == crate::app::WM_APP_SNAPSHOT => {
             with_app(crate::pad::on_snapshot);
+            LRESULT(0)
+        }
+        m if m == crate::app::WM_APP_UPDATE => {
+            // 检查更新的子进程写完 update.json：读回来刷新角标 / 设置窗口
+            update_ui::on_checked();
             LRESULT(0)
         }
         m if m == showpad => {

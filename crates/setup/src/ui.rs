@@ -67,6 +67,15 @@ enum Phase {
     Failed(String),
 }
 
+/// 更新模式（`--update <dir>`）：界面直接进入进度阶段，标题改为「正在更新 HN DeskPad」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// 普通安装（选位置 → 安装）。
+    Install,
+    /// 自更新：不接受位置输入，不碰快捷方式 / 开机自启。
+    Update,
+}
+
 #[derive(Default)]
 struct Progress {
     stage: String,
@@ -83,6 +92,9 @@ struct Ui {
     factory: ID2D1Factory,
     rt: Option<ID2D1HwndRenderTarget>,
     brushes: HashMap<u32, ID2D1Brush>,
+    mode: Mode,
+    /// 自更新模式的目标安装目录（`--update <dir>` 传进来的那个；不改写、不加子目录）。
+    update_dir: Option<PathBuf>,
     f_title: IDWriteTextFormat,
     f_body: IDWriteTextFormat,
     f_btn: IDWriteTextFormat,
@@ -219,6 +231,8 @@ fn init() -> windows::core::Result<Ui> {
             factory,
             rt: None,
             brushes: HashMap::new(),
+            mode: Mode::Install,
+            update_dir: None,
             dpi: GetDpiForWindow(hwnd).max(96),
             parent: install::default_parent(),
             check_desktop: true,
@@ -230,6 +244,95 @@ fn init() -> windows::core::Result<Ui> {
             installed,
         })
     }
+}
+
+/// `--update <dir>`：显示安装程序的窗口，但直接进入进度阶段。
+pub fn run_update(dir: &std::path::Path) {
+    // SAFETY: 进程级 DPI 声明（清单里也有）；失败可忽略。
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let Ok(mut ui) = init() else {
+        // SAFETY: 常量字符串。
+        unsafe { MessageBoxW(None, w!("界面初始化失败。"), w!("HN DeskPad 安装"), MB_ICONERROR) };
+        return;
+    };
+    ui.mode = Mode::Update;
+    ui.update_dir = Some(dir.to_path_buf());
+    let hwnd = ui.hwnd;
+    UI.with(|u| *u.borrow_mut() = Some(ui));
+    let dir = dir.to_path_buf();
+    let h = hwnd.0 as isize;
+    // SAFETY: 后台线程只投递消息；窗口在本线程存活。
+    unsafe {
+        let _ = SetWindowTextW(hwnd, w!("正在更新 HN DeskPad"));
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+    start_update(&dir, h);
+    // SAFETY: 标准消息循环。
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// 启动自更新工作线程。
+fn start_update(dir: &std::path::Path, h: isize) {
+    let phase_thread = with_ui(|u| {
+        u.phase = Phase::Working;
+        u.hover = None;
+    });
+    if phase_thread.is_none() {
+        return;
+    }
+    *PROGRESS.lock().unwrap() = Some(Progress { stage: "正在准备…".into(), ..Default::default() });
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        // SAFETY: 工作线程自己的 COM 套间。
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let r = do_update(&dir, h);
+        if let Some(p) = PROGRESS.lock().unwrap().as_mut() {
+            p.finished = Some(r);
+        }
+        set_progress("", 0, 0, h);
+    });
+}
+
+/// 自更新的实际动作：读清单 → 下载 → SHA-256 → stop_running → extract → register → 启动 → 自动关闭。
+/// 快捷方式和开机自启都不动（安装时已经建好了）。
+fn do_update(dir: &std::path::Path, h: isize) -> Result<PathBuf, String> {
+    install::ensure_writable(dir)?;
+    set_progress("正在获取版本信息…", 0, 0, h);
+    let rel = match net::latest() {
+        Ok(r) => r,
+        Err(e) => return Err(format!("获取版本信息失败：{e}")),
+    };
+    set_progress("正在下载…", 0, 0, h);
+    let zip = net::get(&rel.url, |d, t| {
+        let s = if t > 0 { format!("正在下载 {} / {} MB", mb(d), mb(t)) } else { format!("正在下载 {} MB", mb(d)) };
+        set_progress(&s, d, t, h);
+    })?;
+    set_progress("正在校验…", 1, 1, h);
+    if install::sha256_hex(&zip) != rel.sha256 {
+        return Err("下载的文件校验失败（可能被网络篡改或不完整），请重试".into());
+    }
+    set_progress("正在安装…", 1, 1, h);
+    // 退出正在运行的 DeskPad（先投 WM_APP_QUIT，2 秒后 TerminateProcess）。
+    // 失败也要继续：替换 exe 时目标必须已退出。
+    install::stop_running();
+    let size = install::extract(&zip, dir)?;
+    install::register(dir, &rel.version, size)?;
+    // 启动新版本的 DeskPad；安装程序自己随后自动关闭
+    install::launch(&dir.join(install::EXE));
+    Ok(dir.to_path_buf())
+}
+
+/// 自更新失败：DeskPad 可能已经被 stop_running() 停掉，把它重新拉起来（旧版本可继续用）。
+pub fn restart_after_failure(dir: &std::path::Path) {
+    install::launch(&dir.join(install::EXE));
 }
 
 fn px(dip: f32, dpi: u32) -> i32 {
@@ -250,6 +353,10 @@ fn check_rect() -> (f32, f32, f32, f32) {
 
 impl Ui {
     fn hit(&self, x: f32, y: f32) -> Option<Hit> {
+        // 自更新模式没有位置表单：只有「关闭」主按钮可点
+        if self.mode == Mode::Update {
+            return if inside(PRIMARY_BTN, x, y) { Some(Hit::Primary) } else { None };
+        }
         match self.phase {
             Phase::Working => None,
             Phase::Done(_) => {
@@ -278,6 +385,10 @@ impl Ui {
     }
 
     fn target(&self) -> PathBuf {
+        // 自更新模式直接用传入的目录，不再套一层「HN DeskPad」
+        if let Some(d) = &self.update_dir {
+            return d.clone();
+        }
         install::target_dir(&self.parent)
     }
 
@@ -461,6 +572,14 @@ impl Ui {
     }
 
     fn draw_form(&mut self, phase: &Phase) -> windows::core::Result<()> {
+        // 自更新模式不显示「安装位置」表单：标题下方一行说明 + 进度即可
+        if self.mode == Mode::Update {
+            let f = self.f_cap.clone();
+            self.text(&f, "正在更新，请不要关闭窗口", D2D_RECT_F { left: M, top: 112.0, right: W - M, bottom: 132.0 }, TEXT_SECONDARY)?;
+            let target = self.target();
+            self.text(&f, &format!("安装目录：{}", target.display()), D2D_RECT_F { left: M, top: 156.0, right: W - M, bottom: 176.0 }, TEXT_TERTIARY)?;
+            return self.draw_progress_only(phase);
+        }
         let working = *phase == Phase::Working;
         let f = self.f_cap.clone();
         self.text(&f, "安装位置", D2D_RECT_F { left: M, top: 104.0, right: W - M, bottom: 124.0 }, TEXT_SECONDARY)?;
@@ -488,7 +607,12 @@ impl Ui {
         let on = self.check_desktop;
         self.checkbox(on, "创建桌面快捷方式", !working)?;
 
-        // 底部：进度 / 错误 / 按钮
+        self.draw_progress_only(phase)
+    }
+
+    /// 底部：进度条 / 错误信息 / 主按钮（安装表单与自更新共用）。
+    fn draw_progress_only(&mut self, phase: &Phase) -> windows::core::Result<()> {
+        let working_label = if self.mode == Mode::Update { "正在更新…" } else { "正在安装…" };
         let status_r = D2D_RECT_F { left: M, top: PRIMARY_BTN.1, right: PRIMARY_BTN.0 - 16.0, bottom: PRIMARY_BTN.3 };
         match phase {
             Phase::Working => {
@@ -509,16 +633,19 @@ impl Ui {
                 }
                 let f = self.f_cap.clone();
                 self.text(&f, &stage, status_r, TEXT_SECONDARY)?;
-                self.primary("正在安装…", false)?;
+                self.primary(working_label, false)?;
             }
             Phase::Failed(msg) => {
                 let f = self.f_wrap.clone();
                 self.text(&f, msg, status_r, DANGER)?;
-                self.primary("重试", true)?;
+                let retry = if self.mode == Mode::Update { "关闭" } else { "重试" };
+                self.primary(retry, true)?;
             }
             _ => {
                 let f = self.f_cap.clone();
                 self.text(&f, "安装到当前用户，不需要管理员权限", status_r, TEXT_TERTIARY)?;
+                let target = self.target();
+                let exists = target.join(install::EXE).exists();
                 let label = if self.installed.is_some() || exists { "更新" } else { "安装" };
                 self.primary(label, true)?;
             }
@@ -651,7 +778,8 @@ fn activate(ui: &mut Ui, hit: Hit) {
     match (&ui.phase, hit) {
         (Phase::Working, _) => {}
         (Phase::Done(dir), Hit::Primary) => {
-            if ui.check_launch {
+            // 自更新模式下 DeskPad 已在 do_update 里启动，直接关窗
+            if ui.mode != Mode::Update && ui.check_launch {
                 install::launch(&dir.join(install::EXE));
             }
             // SAFETY: 关闭自身窗口。
@@ -660,6 +788,13 @@ fn activate(ui: &mut Ui, hit: Hit) {
             }
         }
         (Phase::Done(_), Hit::Check) => ui.check_launch = !ui.check_launch,
+        // 自更新失败：「关闭」按钮只关窗（DeskPad 已在失败路径里重新拉起）
+        (Phase::Failed(_), Hit::Primary) if ui.mode == Mode::Update => {
+            // SAFETY: 关闭自身窗口。
+            unsafe {
+                let _ = DestroyWindow(ui.hwnd);
+            }
+        }
         (_, Hit::Check) => ui.check_desktop = !ui.check_desktop,
         (_, Hit::Field) | (_, Hit::Change) => {
             if let Some(p) = choose_folder(ui.hwnd, &ui.parent) {
@@ -802,18 +937,39 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         m if m == WM_APP_PROGRESS => {
+            let mut auto_close = false;
             with_ui(|u| {
                 let fin = PROGRESS.lock().unwrap().as_mut().and_then(|p| p.finished.take());
                 match fin {
                     Some(Ok(dir)) => {
                         u.installed = install::installed_version();
                         u.phase = Phase::Done(dir);
+                        // 自更新模式：成功即自动关闭（DeskPad 已重启）
+                        if u.mode == Mode::Update {
+                            auto_close = true;
+                        }
                     }
-                    Some(Err(e)) => u.phase = Phase::Failed(e),
+                    Some(Err(e)) => {
+                        // 自更新失败：把被停掉的 DeskPad 重新拉起来，再显示错误
+                        if u.mode == Mode::Update {
+                            let dir = u
+                                .update_dir
+                                .clone()
+                                .unwrap_or_else(|| u.target());
+                            restart_after_failure(&dir);
+                        }
+                        u.phase = Phase::Failed(e);
+                    }
                     None => {}
                 }
             });
             invalidate(hwnd);
+            if auto_close {
+                // SAFETY: 关闭自身窗口（工作线程已结束，不会再有进度消息）。
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
             LRESULT(0)
         }
         m if m == WM_APP_LATEST => {

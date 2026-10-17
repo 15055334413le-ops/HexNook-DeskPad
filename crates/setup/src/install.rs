@@ -151,10 +151,33 @@ pub fn extract(zip: &[u8], dir: &Path) -> Result<u64, String> {
 pub fn copy_uninstaller(dir: &Path) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let dst = dir.join(UNINSTALLER);
+    // 发布包里已经带了 uninstall.exe（安装程序自己）时不再复制自身（questions.md #35）
+    if dst.exists() {
+        return Ok(());
+    }
+    // 从 %TEMP% 启动（自更新）时绝不能把 %TEMP% 下的自己当成卸载程序写进去
+    if is_temp_copy(&me) {
+        return Ok(());
+    }
     if me != dst {
         fs::copy(&me, &dst).map_err(|e| format!("写入卸载程序失败：{e}"))?;
     }
     Ok(())
+}
+
+/// 是否正运行在 %TEMP% 里的副本（自更新时由 DeskPad 复制出来的那份）。
+fn is_temp_copy(exe: &Path) -> bool {
+    let temp = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    if temp.as_os_str().is_empty() {
+        return false;
+    }
+    // 前缀比较（大小写不敏感）：TEMP 与 exe 都规范化成绝对路径
+    let exe_lower = exe.to_string_lossy().to_lowercase().replace('/', "\\");
+    let temp_lower = temp.to_string_lossy().to_lowercase().replace('/', "\\");
+    exe_lower.starts_with(&temp_lower)
 }
 
 pub fn start_menu_link() -> Option<PathBuf> {

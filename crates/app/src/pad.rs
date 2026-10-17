@@ -158,6 +158,12 @@ pub fn show(app: &mut App, reason: ShowReason) {
     }
     // 5-#15/6.10：启动台被打开时，引导气泡消失
     crate::corner::dismiss_bubble(app, true);
+    // 在线更新：打开启动台时按 24 小时间隔拉起一次性子进程（不加定时器、不开线程，#35）
+    let (auto, last) = {
+        let s = app.eng.settings();
+        (s.auto_check_update, deskpad_engine::update::load().checked_at)
+    };
+    crate::update_ui::maybe_auto_check(auto, last);
 }
 
 

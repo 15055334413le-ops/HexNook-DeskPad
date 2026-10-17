@@ -50,6 +50,7 @@ D:\MyWork\DeskPad\
 │  │     ├─ single.rs         # 单实例互斥（4.7）
 │  │     ├─ log.rs            # 文件日志（4.9）
 │  │     ├─ win.rs            # RAII 包装与 Win32 小工具（4.9）
+│  │     ├─ update.rs         # 在线更新：子进程检查、版本比较、update.json（4.11）
 │  │     └─ bin\probe.rs      # 无头验证工具（4.10）
 │  └─ app\                    # UI 板块（另一个 agent 负责）
 └─ docs\
@@ -216,6 +217,9 @@ pub struct Settings {
     // v0.2 起删除 launcher_pos / grid_snap：角标按钮位置固定（贴近任务栏左端），
     // 不再支持拖动，也不需要网格吸附（questions.md #33）。
     pub first_run_done: bool,
+    /// 打开启动台时是否自动检查更新（距上次 ≥24 小时才真正发起，questions.md #35）。
+    /// serde default = true，旧 config.json 缺这个字段也能读。
+    pub auto_check_update: bool,
 }
 
 impl Default for Settings {
@@ -228,6 +232,7 @@ impl Default for Settings {
             theme: Theme::Light,
 
             first_run_done: false,
+            auto_check_update: true,
         }
     }
 }
@@ -797,6 +802,33 @@ loop {
 - `CoTaskStr(PWSTR)`：提供 `to_string()`，Drop 时 CoTaskMemFree。
 - `ComInit`：`ComInit::sta()` 调用 CoInitializeEx，Drop 时 CoUninitialize。
 - 小工具：`known_folder(&GUID) -> Option<PathBuf>`、`to_wide(&str) -> Vec<u16>`（以 0 结尾）、`filetime_to_unix(FILETIME) -> i64`。
+
+### 4.11 update.rs — 在线更新（v0.2 新增，questions.md #35）
+
+**红线：WinINet 不进主进程。** 检查更新放在一次性子进程里做（照 4.x 的 `--thumb-pdf` 写法），
+本模块被 app 的 main 识别 `--check-update` 后调用；它不建窗口、不占单实例锁、退出时不做清理。
+为了让主进程的导入表里不出现 `wininet.dll`，本模块**动态加载** WinINet：
+`LoadLibraryW(w!("wininet.dll"))` + `GetProcAddress` 取 6 个导出，签名手写、`transmute` 成函数指针，
+常量（`INTERNET_OPEN_TYPE_PRECONFIG` 等）按 wininet.h 照抄。安装程序（crates/setup）复用同一份实现。
+
+**公开 API：**
+
+| 名字 | 说明 |
+|---|---|
+| `MANIFEST_URL` / `RELEASES_URL` | 发布仓库的 latest.json / 首页 |
+| `is_newer(current, latest) -> bool` | 按 a.b.c 逐段**数字**比；任一边不是三段式 → false |
+| `UpdateInfo` | `update.json` 的内容：`{checked_at, latest, url, sha256, notes, error}`，全部字段 `#[serde(default)]` |
+| `load()` / `save(&UpdateInfo)` | 数据目录下 `update.json` 的读 / 原子写（先 .tmp 再 rename，同 4.6） |
+| `install_dir() -> PathBuf` | `DeskPad.exe` 所在目录（有 `uninstall.exe` 就是安装目录，否则是便携 zip 的解压目录） |
+| `get(url, progress) -> Result<Vec<u8>, String>` | GET 全部字节；WinINet 超时 20 秒，`INTERNET_OPEN_TYPE_PRECONFIG` 跟随系统代理 |
+| `latest() -> Result<Release, String>` | 读 latest.json（version / url / sha256 / notes） |
+| `check_update_worker() -> i32` | 子进程入口：读清单 → 写 update.json → `FindWindowW("DeskPadMain")` 投 `WM_APP_UPDATE`（WM_APP+6）→ 退出 |
+| `UpdateGuard::spawn() -> bool` | 主进程侧：互斥 + 启动 `DeskPad.exe --check-update`（create_new 的 `update.lock`，>5 分钟的陈旧锁先清掉） |
+| `AUTO_CHECK_INTERVAL` | 24×60×60：启动台每次打开时的最短检查间隔 |
+
+**什么时候检查**（不加定时器、UI 不开线程，隐藏时 CPU 为 0）：启动台每次打开时看
+`settings.auto_check_update` 与 `update.json` 的 `checked_at`，满足 24 小时间隔就 `UpdateGuard::spawn()`；
+设置窗口的「检查更新」按钮立即 `spawn()`。子进程写完文件后投消息，主进程只在那一刻读一次、重绘一次。
 
 ### 4.10 bin/probe.rs — 无头验证（必须实现）
 

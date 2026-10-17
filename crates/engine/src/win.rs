@@ -238,18 +238,6 @@ pub fn wait_one(h: HANDLE, ms: u32) -> bool {
     unsafe { windows::Win32::System::Threading::WaitForSingleObject(h, ms) == windows::Win32::Foundation::WAIT_OBJECT_0 }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn filetime_epoch() {
-        use windows::Win32::Foundation::FILETIME;
-        // 1970-01-01 00:00:00 UTC = 116444736000000000（100ns）
-        let t: u64 = 116_444_736_000_000_000;
-        let ft = FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 };
-        assert_eq!(super::filetime_to_unix(ft), 0);
-    }
-}
-
 /// 专用工作集（MB），只用于日志核对内存预算。
 pub fn private_ws_mb() -> f64 {
     use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX2};
@@ -261,4 +249,16 @@ pub fn private_ws_mb() -> f64 {
     // SAFETY: 结构体大小已填写，输出到栈变量。
     let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc as *mut _ as *mut _, pmc.cb) };
     if ok.as_bool() { pmc.PrivateWorkingSetSize as f64 / 1_048_576.0 } else { -1.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn filetime_epoch() {
+        use windows::Win32::Foundation::FILETIME;
+        // 1970-01-01 00:00:00 UTC = 116444736000000000（100ns）
+        let t: u64 = 116_444_736_000_000_000;
+        let ft = FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 };
+        assert_eq!(super::filetime_to_unix(ft), 0);
+    }
 }

@@ -6,6 +6,7 @@ pub mod log;
 pub mod model;
 pub mod search;
 pub mod single;
+pub mod update;
 // 以下为私有模块
 mod apps;
 mod autostart;

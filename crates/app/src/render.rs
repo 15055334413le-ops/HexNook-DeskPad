@@ -327,6 +327,15 @@ fn draw_pad_inner(
         }
         let s = 20.0;
         crate::fileicons::draw_gear(&rt, factory, &ctx.pal, (br.left + br.right - s) / 2.0, (br.top + br.bottom - s) / 2.0, s, if hot { PRIMARY } else { ICON })?;
+        // 有新版本时齿轮右上角一个小 PRIMARY 圆点（6 DIP；不发气泡，#13）
+        if app.update.has_new() {
+            let r = 3.0; // 直径 6
+            let cx = br.right - 1.0 - r;
+            let cy = br.top + 1.0 + r;
+            fill_smooth_rect(factory, &mut ctx.geo, &rt,
+                D2D_RECT_F { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r },
+                r, ctx.pal.get(PRIMARY)?)?;
+        }
     }
 
     // 错误条（3 秒）
