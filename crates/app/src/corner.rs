@@ -13,15 +13,18 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTOPRIMARY,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const BUBBLE_TIMER: usize = 3;
-pub const CORNER_SIZE: f32 = 40.0;
-const GRID_DIP: f32 = 40.0;
+/// 按钮命中区域（DIP）。任务栏内嵌形态只画产品图形，没有背景，所以命中区域就是
+/// 图形四周留一点余量的方块（questions.md #33）。
+pub const CORNER_SIZE: f32 = 28.0;
+/// 产品图形边长（DIP）。
+pub const GLYPH_SIZE: f32 = 18.0;
 
 struct CornerState {
     surface: Surface,
@@ -30,9 +33,6 @@ struct CornerState {
     dpi: u32,
     hover: bool,
     pressed: bool,
-    dragging: bool,
-    /// 按下时鼠标相对按钮主体左上角的偏移（物理像素）。
-    grab: (i32, i32),
     /// 按下时的鼠标屏幕坐标（物理像素）。
     down: (i32, i32),
 }
@@ -44,8 +44,6 @@ thread_local! {
         dpi: 96,
         hover: false,
         pressed: false,
-        dragging: false,
-        grab: (0, 0),
         down: (0, 0),
     });
     static BUBBLE: std::cell::RefCell<Option<(Surface, Option<RenderCtx>)>> =
@@ -80,12 +78,38 @@ fn body_px(dpi: u32) -> i32 {
     (CORNER_SIZE * dpi as f32 / 96.0).round() as i32
 }
 
-fn margin_px(dpi: u32) -> i32 {
+/// 气泡窗口四周的透明边距（物理像素）。只有气泡还带 L2 阴影，按钮本身已经没有背景和阴影。
+fn margin_px_bubble(dpi: u32) -> i32 {
     (SHADOW_MARGIN * dpi as f32 / 96.0).round() as i32
 }
 
-/// 默认位置：主显示器工作区左下角，距左 10 DIP、距下 10 DIP。
+/// 任务栏窗口（主任务栏）。找不到时返回 None（explorer 未启动 / 被 shell 替换）。
+fn taskbar() -> Option<(HWND, RECT)> {
+    // SAFETY: 纯查询；返回的句柄只用于读矩形与排序。
+    let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok()?;
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let mut r = RECT::default();
+    // SAFETY: hwnd 有效，r 为输出参数。
+    unsafe { let _ = GetWindowRect(hwnd, &mut r); }
+    Some((hwnd, r))
+}
+
+/// 按钮位置：内嵌 Windows 底部任务栏——左端靠底（questions.md #30）。
+/// 位置固定、不支持拖动（questions.md #33）。
+/// 任务栏不存在时退回旧的桌面左下角。
 fn default_pos() -> (i32, i32, u32) {
+    if let Some((_, tr)) = taskbar() {
+        let mon = monitor_at((tr.left + tr.right) / 2, (tr.top + tr.bottom) / 2, true);
+        let dpi = dpi_of(mon);
+        let s = dpi as f32 / 96.0;
+        let gap = (8.0 * s).round() as i32;
+        let body = body_px(dpi);
+        // 垂直方向在任务栏里居中；任务栏比按钮高不多，居中即"靠底"
+        let y = tr.top + ((tr.bottom - tr.top) - body) / 2;
+        return (tr.left + gap, y, dpi);
+    }
     let mon = monitor_at(0, 0, true);
     let work = work_of(mon);
     let dpi = dpi_of(mon);
@@ -94,30 +118,18 @@ fn default_pos() -> (i32, i32, u32) {
     (work.left + gap, work.bottom - gap - body_px(dpi), dpi)
 }
 
-/// 把按钮主体钳进它中心点所在显示器的工作区；返回 (x, y, dpi)。
-fn clamp_body(bx: i32, by: i32) -> (i32, i32, u32) {
-    let probe_dpi = corner_dpi();
-    let half = body_px(probe_dpi) / 2;
-    let mon = monitor_at(bx + half, by + half, false);
-    let work = work_of(mon);
-    let dpi = dpi_of(mon);
-    let body = body_px(dpi);
-    let x = bx.clamp(work.left, (work.right - body).max(work.left));
-    let y = by.clamp(work.top, (work.bottom - body).max(work.top));
-    (x, y, dpi)
-}
-
-/// 创建角标与气泡窗口，读取设置里的位置并摆放。
+/// 创建角标与气泡窗口并摆放（位置固定，见 [`default_pos`]）。
 pub fn create() -> Result<()> {
     win::register_class(w!("DeskPadCorner"), Some(corner_proc), None)?;
     win::register_class(w!("DeskPadBubble"), Some(bubble_proc), None)?;
     let ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    // 顶层分层窗口，定位在任务栏左端、层级 HWND_TOPMOST（questions.md #31）。
     let corner = win::create_window(w!("DeskPadCorner"), w!(""), WS_POPUP, ex, None, 0, 0, 0, 0)?;
     let bubble = win::create_window(w!("DeskPadBubble"), w!(""), WS_POPUP, ex, None, 0, 0, 0, 0)?;
     with_app(|a| {
         a.corner = corner;
         a.bubble = bubble;
-        a.corner_pos = a.eng.settings().launcher_pos;
+        a.corner_pos = None;
     });
     reposition();
     Ok(())
@@ -129,42 +141,34 @@ pub fn reposition() {
 }
 
 fn reposition_with(a: &mut App) {
-    let (bx, by, dpi) = match a.corner_pos {
-        Some((x, y)) => clamp_body(x, y),
-        None => default_pos(),
-    };
-    // 只有用户拖动过才记住位置；默认位置不写回 corner_pos，换主屏后仍回到默认角落
-    if a.corner_pos.is_some() {
-        a.corner_pos = Some((bx, by));
-    }
+    // 位置固定：始终贴任务栏左端（questions.md #33，不再支持拖动）。
+    a.corner_pos = None;
+    let (bx, by, dpi) = default_pos();
     CORNER.with_borrow_mut(|cs| cs.dpi = dpi);
-    let m = margin_px(dpi);
-    let total = body_px(dpi) + 2 * m;
-    // SAFETY: 窗口句柄有效；层级在 WM_WINDOWPOSCHANGING 里强制为 HWND_BOTTOM。
+    let total = body_px(dpi);
+    // 屏幕物理像素定位；z 序由 WM_WINDOWPOSCHANGING 设为 HWND_TOPMOST。
+    // 不做 SetParent：跨进程子窗口会被任务栏自己的绘制盖住（questions.md #31）。
+    // SAFETY: 窗口句柄有效。
     unsafe {
-        let _ = SetWindowPos(a.corner, HWND_BOTTOM, bx - m, by - m, total, total, SWP_NOACTIVATE);
+        let _ = SetWindowPos(a.corner, HWND_TOPMOST, bx, by, total, total, SWP_NOACTIVATE);
     }
-    let _ = present_corner(a, (bx, by));
+    if let Err(e) = present_corner(a, (bx, by)) {
+        deskpad_engine::log::warn(&format!("corner present failed: {e}"));
+    }
     // SAFETY: 不抢焦点地显示。
     unsafe { let _ = ShowWindow(a.corner, SW_SHOWNOACTIVATE); }
 }
 
 /// 当前按钮主体左上角（物理像素）。
-fn body_pos(a: &App) -> (i32, i32) {
-    match a.corner_pos {
-        Some(p) => p,
-        None => {
-            let (x, y, _) = default_pos();
-            (x, y)
-        }
-    }
+fn body_pos(_a: &App) -> (i32, i32) {
+    let (x, y, _) = default_pos();
+    (x, y)
 }
 
 fn present_corner(a: &App, body: (i32, i32)) -> Result<()> {
     CORNER.with_borrow_mut(|cs| {
         let dpi = cs.dpi.max(96);
-        let m = margin_px(dpi);
-        let total = body_px(dpi) + 2 * m;
+        let total = body_px(dpi);
         if cs.surface.size != (total, total) {
             cs.ctx = None; // DPI 变了，旧 RT 上的设备资源作废
         }
@@ -178,7 +182,7 @@ fn present_corner(a: &App, body: (i32, i32)) -> Result<()> {
         if let Some(ctx) = cs.ctx.as_mut() {
             draw_corner(a, ctx, &a.factory, hover)?;
         }
-        cs.surface.present(a.corner, POINT { x: body.0 - m, y: body.1 - m }, 255)
+        cs.surface.present(a.corner, POINT { x: body.0, y: body.1 }, 255)
     })
 }
 
@@ -188,12 +192,6 @@ pub fn redraw() {
         let body = body_pos(a);
         let _ = present_corner(a, body);
     });
-}
-
-/// 设置窗口 [重置到默认] 保存后调用。
-pub fn reposition_to_default(a: &mut App) {
-    a.corner_pos = None;
-    reposition_with(a);
 }
 
 /// WM_DISPLAYCHANGE / WM_SETTINGCHANGE(SPI_SETWORKAREA)：重新钳回可见工作区。
@@ -218,11 +216,11 @@ pub fn show_bubble(a: &mut App) {
     let (w_dip, h_dip) = crate::render::bubble_size();
     let total_w = ((w_dip + 2.0 * SHADOW_MARGIN) * scale).round() as i32;
     let total_h = ((h_dip + 2.0 * SHADOW_MARGIN) * scale).round() as i32;
-    let m = margin_px(dpi);
     let body = body_px(dpi);
     let gap = (8.0 * scale).round() as i32;
     let work = work_of(monitor_at(bx, by, false));
-    // 右侧：气泡主体左边距按钮 8 DIP，垂直居中对齐按钮
+    let m = margin_px_bubble(dpi);
+    // 右侧：气泡（含自身阴影边距 m）左边距按钮 8 DIP，垂直居中对齐按钮
     let mut px = bx + body + gap - m;
     let mut py = by + body / 2 - total_h / 2;
     if px + total_w - m > work.right {
@@ -303,31 +301,17 @@ fn track_leave(hwnd: HWND) {
 }
 
 /// 拖动中：按鼠标位置计算新的主体位置（含网格吸附），并移动窗口。
-fn drag_to(a: &mut App, cursor: (i32, i32), grab: (i32, i32)) {
-    let dpi = corner_dpi();
-    let mut nx = cursor.0 - grab.0;
-    let mut ny = cursor.1 - grab.1;
-    if a.eng.settings().grid_snap {
-        let g = ((GRID_DIP * dpi as f32 / 96.0).round() as i32).max(1);
-        let work = work_of(monitor_at(cursor.0, cursor.1, false));
-        let snap = |v: i32, origin: i32| origin + ((v - origin) as f32 / g as f32).round() as i32 * g;
-        nx = snap(nx, work.left);
-        ny = snap(ny, work.top);
-    }
-    a.corner_pos = Some((nx, ny));
-    reposition_with(a);
-}
-
 pub unsafe extern "system" fn corner_proc(
     hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        // 始终待在普通窗口下面，像桌面的一部分（UI 文档 6.10）
+        // 层级（UI 文档 6.10）：内嵌任务栏 → 置顶（与任务栏同属 topmost 段，
+        // 绘制在任务栏之上，不被其绘制流程盖住）。
         WM_WINDOWPOSCHANGING => {
             let wp = lparam.0 as *mut WINDOWPOS;
             if !wp.is_null() {
                 // SAFETY: lParam 指向系统提供的 WINDOWPOS，改写 hwndInsertAfter 合法。
-                (*wp).hwndInsertAfter = HWND_BOTTOM;
+                (*wp).hwndInsertAfter = HWND_TOPMOST;
                 (*wp).flags &= !SWP_NOZORDER;
             }
             LRESULT(0)
@@ -337,45 +321,29 @@ pub unsafe extern "system" fn corner_proc(
             // SAFETY: 捕获鼠标直到 BUTTONUP / CAPTURECHANGED。
             unsafe { let _ = SetCapture(hwnd); }
             let cur = screen_cursor();
-            let body = with_app(|a| body_pos(a)).unwrap_or(cur);
             CORNER.with_borrow_mut(|cs| {
                 cs.pressed = true;
-                cs.dragging = false;
                 cs.down = cur;
-                cs.grab = (cur.0 - body.0, cur.1 - body.1);
             });
             with_app(|a| dismiss_bubble(a, true));
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             track_leave(hwnd);
-            let cur = screen_cursor();
             let dpi = corner_dpi();
-            // SAFETY: 纯查询。
-            let (tx, ty) = unsafe {
-                (GetSystemMetricsForDpi(SM_CXDRAG, dpi), GetSystemMetricsForDpi(SM_CYDRAG, dpi))
-            };
             let x = win::get_x_lparam(lparam);
             let y = win::get_y_lparam(lparam);
-            let m = margin_px(dpi);
             let body = body_px(dpi);
-            let inside = x >= m && y >= m && x < m + body && y < m + body;
-            // 先在一次短借用里算出要做什么，再在借用之外执行
-            let (drag, grab, hover_changed) = CORNER.with_borrow_mut(|cs| {
-                if cs.pressed && !cs.dragging
-                    && ((cur.0 - cs.down.0).abs() > tx || (cur.1 - cs.down.1).abs() > ty)
-                {
-                    cs.dragging = true;
-                }
-                let changed = !cs.dragging && cs.hover != inside;
-                if changed {
+            let inside = x >= 0 && y >= 0 && x < body && y < body;
+            let changed = CORNER.with_borrow_mut(|cs| {
+                if cs.hover != inside {
                     cs.hover = inside;
+                    true
+                } else {
+                    false
                 }
-                (cs.dragging, cs.grab, changed)
             });
-            if drag {
-                with_app(|a| drag_to(a, cur, grab));
-            } else if hover_changed {
+            if changed {
                 redraw();
             }
             LRESULT(0)
@@ -388,31 +356,16 @@ pub unsafe extern "system" fn corner_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let (pressed, dragging) = CORNER.with_borrow_mut(|cs| {
-                let r = (cs.pressed, cs.dragging);
-                cs.pressed = false;
-                cs.dragging = false;
-                r
-            });
+            let pressed = CORNER.with_borrow_mut(|cs| std::mem::replace(&mut cs.pressed, false));
             // SAFETY: 与 SetCapture 配对（会触发 WM_CAPTURECHANGED，此时状态已清零）。
             unsafe { let _ = ReleaseCapture(); }
-            if dragging {
-                with_app(|a| {
-                    reposition_with(a); // 钳回工作区
-                    let mut s = a.eng.settings();
-                    s.launcher_pos = a.corner_pos;
-                    let _ = a.eng.save_settings(&s);
-                });
-            } else if pressed {
+            if pressed {
                 with_app(|a| crate::pad::toggle(a, ShowReason::Corner));
             }
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            CORNER.with_borrow_mut(|cs| {
-                cs.pressed = false;
-                cs.dragging = false;
-            });
+            CORNER.with_borrow_mut(|cs| cs.pressed = false);
             LRESULT(0)
         }
         WM_RBUTTONUP => {
@@ -421,7 +374,7 @@ pub unsafe extern "system" fn corner_proc(
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            // 拖到另一块 DPI 不同的显示器：按新 DPI 重排（位置不变）
+            // DPI 变化：按新 DPI 重排（位置不变，固定贴任务栏左端）
             reposition();
             LRESULT(0)
         }

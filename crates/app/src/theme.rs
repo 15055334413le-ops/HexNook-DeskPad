@@ -16,6 +16,10 @@ pub const SELECT_BG: u32 = 0xFFEAF2FF;      // 选中 / 浅蓝背景
 pub const ROW_HOVER: u32 = 0xFFF7F7F7;      // 文件行 hover
 pub const DANGER: u32 = 0xFFD93025;         // 错误提示文字
 pub const SCRIM: u32 = 0x4D0F121A;          // 背景幕 rgba(15,18,26,0.30)
+/// 任务栏启动按钮的命中区填充：3% 黑，肉眼不可见，但让整块 28 DIP 都能接收点击
+/// （questions.md #33）。分层窗口按像素 alpha 判定命中，四块图形之间 alpha=0 的
+/// 缝隙会把点击漏给任务栏。
+pub const HIT_SHIELD: u32 = 0x08000000;
 // 圆角（4 的倍数递进；连续曲率，见 smooth.rs）
 pub const RADIUS_CARD: f32 = 10.0;          // 启动台三大面板
 pub const RADIUS_INPUT: f32 = 6.0;          // 搜索框

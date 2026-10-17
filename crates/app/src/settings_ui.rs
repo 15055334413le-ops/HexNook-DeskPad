@@ -1,4 +1,4 @@
-//! 设置窗口（UI 文档 6.11）：tofour Modal，含热键单选、自启/网格对齐勾选、按钮位置重置、重看引导。
+//! 设置窗口（UI 文档 6.11）：tofour Modal，含热键单选、自启勾选、重看引导。
 //!
 //! 借用规则：S 每次只借一下；DestroyWindow / SetForegroundWindow / with_app 等都在借用之外调用。
 //! 渲染目标的 DPI 已设为显示器 DPI，所以这里所有坐标都是 DIP，不要再乘缩放系数。
@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 主体尺寸（DIP，不含阴影边距）。
 const W: f32 = 420.0;
-const H: f32 = 400.0;
+const H: f32 = 320.0;
 const LABEL_X: f32 = 24.0;
 const CTRL_X: f32 = 136.0;
 const HEADER_H: f32 = 48.0;
@@ -30,8 +30,6 @@ const HEADER_H: f32 = 48.0;
 enum Ctl {
     Radio(usize), // HotkeyPreset::ALL 下标
     CheckAuto,
-    CheckSnap,
-    BtnReset,
     BtnReplay,
     BtnCancel,
     BtnSave,
@@ -39,13 +37,11 @@ enum Ctl {
 }
 
 /// Tab 顺序（CloseX 不参与 Tab）。
-const TAB_ORDER: [Ctl; 9] = [
+const TAB_ORDER: [Ctl; 7] = [
     Ctl::Radio(0),
     Ctl::Radio(1),
     Ctl::Radio(2),
     Ctl::CheckAuto,
-    Ctl::CheckSnap,
-    Ctl::BtnReset,
     Ctl::BtnReplay,
     Ctl::BtnCancel,
     Ctl::BtnSave,
@@ -57,9 +53,7 @@ fn ctl_rect(c: Ctl) -> D2D_RECT_F {
     match c {
         Ctl::Radio(i) => r(CTRL_X, 62.0 + i as f32 * 26.0, 240.0, 22.0),
         Ctl::CheckAuto => r(CTRL_X, 184.0, 240.0, 22.0),
-        Ctl::CheckSnap => r(CTRL_X, 214.0, 240.0, 22.0),
-        Ctl::BtnReset => r(CTRL_X, 270.0, 104.0, 28.0),
-        Ctl::BtnReplay => r(CTRL_X, 310.0, 120.0, 28.0),
+        Ctl::BtnReplay => r(CTRL_X, 216.0, 120.0, 28.0),
         Ctl::BtnCancel => r(W - 24.0 - 100.0 - 12.0 - 80.0, H - 46.0, 80.0, 32.0),
         Ctl::BtnSave => r(W - 24.0 - 100.0, H - 46.0, 100.0, 32.0),
         Ctl::CloseX => r(W - 40.0, 12.0, 24.0, 24.0),
@@ -86,9 +80,7 @@ struct State {
     ctx: Option<RenderCtx>,
     hotkey_idx: usize,
     autostart: bool,
-    grid_snap: bool,
     replay: bool,
-    reset_pos: bool,
     hover: Option<Ctl>,
     pressed: Option<Ctl>,
     focus: Option<Ctl>,
@@ -159,9 +151,7 @@ pub fn open(_main: HWND) -> Result<()> {
             ctx: None,
             hotkey_idx,
             autostart: s.autostart,
-            grid_snap: s.grid_snap,
             replay: false,
-            reset_pos: false,
             hover: None,
             pressed: None,
             focus: None,
@@ -187,10 +177,10 @@ fn close() {
     }
 }
 
-/// 保存：热键 → 设置 → 角标位置 → 引导气泡；热键冲突时留在窗口上显示错误。
+/// 保存：热键 → 设置 → 引导气泡；热键冲突时留在窗口上显示错误。
 fn save() {
-    let Some((hk_idx, autostart, grid_snap, replay, reset_pos)) = S.with_borrow(|s| {
-        s.as_ref().map(|st| (st.hotkey_idx, st.autostart, st.grid_snap, st.replay, st.reset_pos))
+    let Some((hk_idx, autostart, replay)) = S.with_borrow(|s| {
+        s.as_ref().map(|st| (st.hotkey_idx, st.autostart, st.replay))
     }) else {
         return;
     };
@@ -204,19 +194,12 @@ fn save() {
             s.hotkey = new_hk;
         }
         s.autostart = autostart;
-        s.grid_snap = grid_snap;
-        if reset_pos {
-            s.launcher_pos = None;
-        }
         if replay {
             s.first_run_done = false;
         }
         if let Err(e) = a.eng.save_settings(&s) {
             deskpad_engine::log::warn(&format!("settings save: {e:?}"));
             return Err("写入设置失败，详情见日志".into());
-        }
-        if reset_pos {
-            crate::corner::reposition_to_default(a);
         }
         if replay {
             crate::corner::show_bubble(a);
@@ -272,9 +255,7 @@ fn draw(st: &mut State) -> Result<()> {
     let view = View {
         hotkey_idx: st.hotkey_idx,
         autostart: st.autostart,
-        grid_snap: st.grid_snap,
         replay: st.replay,
-        reset_pos: st.reset_pos,
         hover: st.hover,
         pressed: st.pressed,
         focus: st.focus,
@@ -290,9 +271,7 @@ fn draw(st: &mut State) -> Result<()> {
 struct View {
     hotkey_idx: usize,
     autostart: bool,
-    grid_snap: bool,
     replay: bool,
-    reset_pos: bool,
     hover: Option<Ctl>,
     pressed: Option<Ctl>,
     focus: Option<Ctl>,
@@ -334,7 +313,7 @@ fn draw_inner(ctx: &mut RenderCtx, factory: &ID2D1Factory, rt: &ID2D1RenderTarge
     fill_smooth_rect(factory, &mut ctx.geo, rt, rect(0.0, HEADER_H, W, 1.0), 0.0, ctx.pal.get(BORDER)?)?;
 
     // 左侧标签
-    for (label, y) in [("快捷键", 62.0), ("开机自启", 184.0), ("网格对齐", 214.0), ("启动按钮位置", 244.0), ("首次引导", 310.0)] {
+    for (label, y) in [("快捷键", 62.0), ("开机自启", 184.0), ("首次引导", 216.0)] {
         text(rt, &ctx.f_body, label, rect(LABEL_X, y, CTRL_X - LABEL_X - 8.0, 22.0), ctx.pal.get(TEXT_PRIMARY)?);
     }
 
@@ -362,10 +341,8 @@ fn draw_inner(ctx: &mut RenderCtx, factory: &ID2D1Factory, rt: &ID2D1RenderTarge
     }
 
     // 勾选框
-    for (c, checked, label) in [
-        (Ctl::CheckAuto, v.autostart, "开机时自动启动"),
-        (Ctl::CheckSnap, v.grid_snap, "拖动桌面图标时对齐网格"),
-    ] {
+    {
+        let (c, checked, label) = (Ctl::CheckAuto, v.autostart, "开机时自动启动");
         let r = at(ctl_rect(c));
         let cy = (r.top + r.bottom) / 2.0;
         let b = D2D_RECT_F { left: r.left, top: cy - 8.0, right: r.left + 16.0, bottom: cy + 8.0 };
@@ -386,10 +363,6 @@ fn draw_inner(ctx: &mut RenderCtx, factory: &ID2D1Factory, rt: &ID2D1RenderTarge
         text(rt, &ctx.f_body, label, tr, ctx.pal.get(TEXT_PRIMARY)?);
     }
 
-    // 启动按钮位置
-    text(rt, &ctx.f_small, "在桌面上拖动左下角图标即可调整",
-        rect(CTRL_X, 247.0, W - CTRL_X - 24.0, 16.0), ctx.pal.get(TEXT_SECONDARY)?);
-    secondary_btn(ctx, factory, rt, Ctl::BtnReset, if v.reset_pos { "将重置 ✓" } else { "重置到默认" }, v, v.reset_pos)?;
     secondary_btn(ctx, factory, rt, Ctl::BtnReplay, if v.replay { "将重新显示 ✓" } else { "重新显示引导" }, v, v.replay)?;
 
     // Footer
@@ -455,14 +428,6 @@ fn activate(st: &mut State, c: Ctl) -> After {
         }
         Ctl::CheckAuto => {
             st.autostart = !st.autostart;
-            After::Redraw
-        }
-        Ctl::CheckSnap => {
-            st.grid_snap = !st.grid_snap;
-            After::Redraw
-        }
-        Ctl::BtnReset => {
-            st.reset_pos = !st.reset_pos;
             After::Redraw
         }
         Ctl::BtnReplay => {

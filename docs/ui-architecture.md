@@ -389,39 +389,39 @@ dirs_card = (files_card.x, files_card.bottom + GAP_CARD, right_w, content_h − 
 - `SPI_GETCLIENTAREAANIMATION == FALSE` 时直接跳到终态（5-#10）。
 - 动画结束后 `KillTimer`。
 
-### 6.10 corner.rs — 桌面角标按钮（唯一常驻在桌面上的元素）
+### 6.10 corner.rs — 启动按钮（内嵌任务栏左端，唯一常驻元素）
 
-- 窗口：`WS_POPUP`；`WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，**不加 TOPMOST**。主体 40×40 DIP，窗口每边再加 `SHADOW_MARGIN` 透明边距。
-- **层级**：处理 `WM_WINDOWPOSCHANGING`，强制 `hwndInsertAfter = HWND_BOTTOM` 并去掉 `SWP_NOZORDER`，让它始终待在普通窗口下面，像桌面的一部分。
-  - 被窗口遮住属于正常现象；按 Win+D 后可能被桌面层盖住，v0.1 接受这一点（热键和托盘仍然可用）。
-- **位置**：
-  - `settings.launcher_pos` 为 None → 主显示器工作区左下角，距左 10 DIP、距下 10 DIP；
-  - 为 Some((x, y)) → 使用该物理像素坐标，并钳制到 `MonitorFromPoint` 所在显示器的工作区内。
-- **绘制**：`INPUT` 白底 + 1px `BORDER` + `RADIUS_ITEM` 平滑圆角 + L1 阴影 + 居中的产品图形（6.12，16 DIP）。Hover 时边框变 `BORDER_HOVER`，阴影变 L2。
+- 窗口：`WS_POPUP` + `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`。命中区域 28×28 DIP，窗口即命中区域，**不再留 `SHADOW_MARGIN` 透明边距**（按钮没有背景和阴影，见"绘制"）。
+- **位置固定，不支持拖动**（questions.md #33）：只贴任务栏左端一处——`FindWindowW("Shell_TrayWnd")` 取主任务栏矩形，`x = 任务栏左边缘 + 8 DIP`、`y = 任务栏内垂直居中`（按按钮所在显示器 DPI 换算物理像素）。任务栏不存在（explorer 未启动 / 被 shell 替换）时退回桌面左下角，距左 10 DIP、距下 10 DIP。
+  - 位置在 `WM_DISPLAYCHANGE` / `WM_SETTINGCHANGE(SPI_SETWORKAREA)` / `WM_DPICHANGED` 时重算，始终贴任务栏；没有拖动、没有网格吸附、不写位置设置。
+- **层级**：`WM_WINDOWPOSCHANGING` 强制 `hwndInsertAfter = HWND_TOPMOST` —— 与任务栏同属 topmost 段并绘制在任务栏之上。
+- **禁止 `SetParent` 到任务栏**：跨进程子窗口能创建成功、`PrintWindow` 也能取到正确画面，但任务栏自己的绘制流程会把它盖住，用户完全看不见（questions.md #31 实测）。只做"定位 + 层级"，窗口始终是本进程的顶层窗口，explorer 重启不会连带销毁。
+- **绘制**：**无背景、无边框、无阴影**，只画居中的产品图形（6.12，18 DIP，默认 `PRIMARY`，Hover 变 `PRIMARY_HOVER`）。任务栏本身有底色，加白色卡片会像贴上去的一块，破坏"像系统自带"的目标（questions.md #33）。
+  - 命中区先铺一层 `HIT_SHIELD`（`theme.rs`，`0x08000000`，3% 黑，肉眼不可见）：分层窗口按像素 alpha 判定命中，不铺这一层时四块图形之间 alpha=0 的缝隙会把点击漏给任务栏，点图标正中央反而没反应。**新增颜色必须同时加进 `RenderCtx` 的 palette 列表**，否则 `pal.get()` 找不到画刷、整个 `draw_corner` 失败、按钮直接不显示（questions.md #33）。
 - **交互**：
-  - 左键按下 → `SetCapture`；
-  - 移动距离超过 `SM_CXDRAG` → 进入拖动模式；`grid_snap` 为真时，位置按 40 DIP 网格吸附（相对于所在显示器工作区的左上角）；
-  - 左键抬起：拖动模式下，钳回工作区并 `save_settings(launcher_pos = Some(物理坐标))`；否则 `pad::toggle(ShowReason::Corner)`；
+  - 左键单击 → `pad::toggle(ShowReason::Corner)`（只区分按下/抬起，没有拖动判定）；
   - 右键 → 系统原生菜单【打开启动台 / 设置… / 退出】。
+
+### 6.10.1 与任务栏的关系（为什么是覆盖窗口）
+
+Windows 没有给第三方应用"往任务栏里加按钮"的公开接口：老的 DeskBand / 任务栏工具栏（`Shell_TrayWnd` + `TB_` 按钮）在 Windows 7 起被移除；Windows 11 的任务栏是 XAML + Composition 的私有实现，没有扩展点。官方可用的只有通知区域图标（`Shell_NotifyIcon`，且 Win11 默认折叠进溢出区），那不是任务栏按钮。因此这里采用"贴准位置 + 正确层级"的覆盖窗口，等价于视觉内嵌；注入 hook 或改 explorer 属于红线，禁止。
+
 - **首次引导气泡**：
   - 独立的分层窗口，放在按钮右侧 8 DIP 处（右侧空间不够就放在上方）；
   - 样式：tofour Toast，`INPUT` 白底 + 1px `BORDER` + `RADIUS_TOAST` + L2 阴影；文字 `FS_BODY`；
   - 文案：「点击这里，或按 {hotkey.label()} 打开启动台」；
-  - **消失条件**：点击气泡本身、点击角标、启动台被打开、或 8 秒后，任一满足即消失（v1 写的"点击任意处"需要全局钩子，违反红线，已删除）；
+  - **消失条件**：点击气泡本身、点击角标、启动台被打开、或 8 秒后，任一满足即消失；
   - 消失后执行 `first_run_done = true; save_settings`。
-
 ### 6.11 settings_ui.rs — 设置窗口
 
-- 窗口：分层窗口，tofour Modal 样式（白底 + `RADIUS_MODAL` + L3 阴影），主体 420×400 DIP，居中显示在鼠标所在显示器；`WS_EX_TOOLWINDOW`，不加 TOPMOST。
+- 窗口：分层窗口，tofour Modal 样式（白底 + `RADIUS_MODAL` + L3 阴影），主体 420×320 DIP，居中显示在鼠标所在显示器；`WS_EX_TOOLWINDOW`，不加 TOPMOST。
 - 同一时间只存在一个设置窗口，重复打开时激活已有的那个。打开设置窗口时，启动台先隐藏。
 - **布局**（距主体左边 24 DIP）：
   1. Header：标题「设置」（`FS_TITLE`/600），右上角 × 按钮，下方 1px `BORDER` 分隔线。按住 Header 可以拖动窗口。
   2. 快捷键：3 个单选项（`HotkeyPreset::ALL`，显示 `label()`），下方是说明文字（6.3），以及冲突时的行内错误。
   3. 开机自启：勾选框 →「开机时自动启动」。
-  4. 网格对齐：勾选框 →「拖动桌面图标时对齐网格」。
-  5. 启动按钮位置：说明文字「在桌面上拖动左下角图标即可调整」+ 次要按钮 [重置到默认]。
-  6. 首次引导：次要按钮 [重新显示引导]。
-  7. Footer：上方 1px 分隔线，右对齐 [取消]（次要按钮）和 [保存]（主按钮）。
+  4. 首次引导：次要按钮 [重新显示引导]。
+  5. Footer：上方 1px 分隔线，右对齐 [取消]（次要按钮）和 [保存]（主按钮）。
 - **控件样式**：
   - 主按钮：`PRIMARY` 底、白字、高 32、`RADIUS_INPUT`，hover 用 `PRIMARY_HOVER`，按下用 `PRIMARY_PRESSED`；
   - 次要按钮：白底 + 1px `BORDER`，文字 `TEXT_PRIMARY`；
@@ -431,9 +431,8 @@ dirs_card = (files_card.x, files_card.bottom + GAP_CARD, right_w, content_h − 
 - **保存**：
   1. 热键有变化 → `hotkey::change`，失败时停在窗口上并显示错误；
   2. `eng.save_settings`；
-  3. 位置被重置 → `corner::reposition()`；
-  4. 点过重新显示引导 → `first_run_done = false`，弹出气泡；
-  5. 关闭窗口。
+  3. 点过重新显示引导 → `first_run_done = false`，弹出气泡；
+  4. 关闭窗口。
 
 ### 6.12 glyph.rs — 产品图形
 

@@ -521,7 +521,7 @@ mod t {
           source: AppSource::StartMenu, keys: SearchKeys { name_lower: name.to_lowercase(), initials: initials.into(), alias: alias.into(), sort_key: name.to_lowercase() } }
     }
     #[test] fn settings_roundtrip() {
-        let s = Settings { launcher_pos: Some((-1200, 300)), ..Default::default() };
+        let s = Settings { max_recent: 12, ..Default::default() };
         let j = serde_json::to_string_pretty(&s).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&j).unwrap(), s);
         // 缺字段、多出未知字段的旧配置也必须能读，且已有字段保留

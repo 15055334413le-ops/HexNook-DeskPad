@@ -122,7 +122,7 @@ impl RenderCtx {
         let palette = [
             PRIMARY, PRIMARY_HOVER, PRIMARY_PRESSED, BACKGROUND, SURFACE, INPUT, TEXT_PRIMARY,
             TEXT_SECONDARY, TEXT_TERTIARY, BORDER, BORDER_HOVER, ICON, SELECT_BG, ROW_HOVER,
-            DANGER, SCRIM, 0x0A000000, 0xFFFFFFFF, 0xFFFF0000,
+            DANGER, SCRIM, HIT_SHIELD, 0x0A000000, 0xFFFFFFFF, 0xFFFF0000,
         ];
         let chips = [
             FileKind::Document, FileKind::Spreadsheet, FileKind::Presentation, FileKind::Pdf,
@@ -500,9 +500,9 @@ fn draw_pad_inner(
                 grid_cell_state(ctx, factory, &rt, &cell, hovered, sel)?;
                 let up = if hot { 2.0 } else { 0.0 };
                 let cx = cell.x + cell.w / 2.0;
-                crate::fileicons::draw_folder_tile(&rt, factory, &mut ctx.geo, &mut ctx.tiles, &ctx.pal, scale, cx - 23.0, cell.y + 10.0 - up, hot, &d.name)?;
+                crate::fileicons::draw_folder_tile(&rt, factory, &mut ctx.geo, &mut ctx.tiles, &ctx.pal, scale, cx - 23.0, cell.y + 8.0 - up, hot, &d.name)?;
                 draw_text_trimmed(&rt, &ctx.dwrite, &ctx.f_cap_c, &d.name,
-                    D2D_RECT_F { left: cell.x + 3.0, top: cell.y + 55.0, right: cell.right() - 3.0, bottom: cell.y + 71.0 },
+                    D2D_RECT_F { left: cell.x + 3.0, top: cell.y + 58.0, right: cell.right() - 3.0, bottom: cell.y + 74.0 },
                     ctx.pal.get(TEXT_PRIMARY)?);
             }
         }
@@ -570,14 +570,14 @@ pub fn draw_corner(
     unsafe { rt.BeginDraw() };
     unsafe { rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })) };
     let r = (|| -> Result<()> {
-        let m = SHADOW_MARGIN;
-        let body = D2D_RECT_F { left: m, top: m, right: m + 40.0, bottom: m + 40.0 };
-        let (blur, dy, al) = if hover { SHADOW_L2 } else { SHADOW_L1 };
-        draw_soft_shadow(factory, &mut ctx.tiles, &rt, body, RADIUS_ITEM, blur, dy, al, rt.dpi_scale())?;
-        fill_smooth_rect(factory, &mut ctx.geo, &rt, body, RADIUS_ITEM, ctx.pal.get(INPUT)?)?;
-        draw_smooth_rect(factory, &mut ctx.geo, &rt, body, RADIUS_ITEM, ctx.pal.get(if hover { BORDER_HOVER } else { BORDER })?, 1.0)?;
-        // 产品图形 16 DIP 居中
-        crate::glyph::draw_glyph(&rt, factory, &mut ctx.geo, ctx.pal.get(PRIMARY)?, m + 20.0, m + 20.0, 16.0)?;
+        // 任务栏内嵌形态：无背景、无边框、无阴影，只画产品图形（questions.md #33）。
+        // 任务栏本身有底色，白色卡片会显得像贴上去的一块，破坏"像系统自带"的目标。
+        let size = crate::corner::CORNER_SIZE;
+        // 命中区底：alpha=1 的近乎透明填充。分层窗口按像素 alpha 命中测试，四块图形
+        // 之间的缝隙会漏到任务栏上，点起来发飘；铺一层看不见的底让整块 28 DIP 都能点。
+        fill_smooth_rect(factory, &mut ctx.geo, &rt, D2D_RECT_F { left: 0.0, top: 0.0, right: size, bottom: size }, RADIUS_ITEM, ctx.pal.get(HIT_SHIELD)?)?;
+        let ink = if hover { PRIMARY_HOVER } else { PRIMARY };
+        crate::glyph::draw_glyph(&rt, factory, &mut ctx.geo, ctx.pal.get(ink)?, size / 2.0, size / 2.0, crate::corner::GLYPH_SIZE)?;
         Ok(())
     })();
     let end = unsafe { rt.EndDraw(None, None) };

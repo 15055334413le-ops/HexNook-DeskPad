@@ -213,8 +213,8 @@ pub struct Settings {
     /// v0.1 只实现 Light；Dark 存在但 UI 按 Light 绘制。
     pub theme: Theme,
     /// 角标按钮 40×40 主体（不含阴影边距）左上角，虚拟屏幕物理像素。None = 默认位置。
-    pub launcher_pos: Option<(i32, i32)>,
-    pub grid_snap: bool,
+    // v0.2 起删除 launcher_pos / grid_snap：角标按钮位置固定（贴近任务栏左端），
+    // 不再支持拖动，也不需要网格吸附（questions.md #33）。
     pub first_run_done: bool,
 }
 
@@ -226,8 +226,7 @@ impl Default for Settings {
             autostart: false,
             max_recent: 8,
             theme: Theme::Light,
-            launcher_pos: None,
-            grid_snap: true,
+
             first_run_done: false,
         }
     }
@@ -382,7 +381,7 @@ mod t {
           source: AppSource::StartMenu, keys: SearchKeys { name_lower: name.to_lowercase(), initials: initials.into(), alias: alias.into(), sort_key: name.to_lowercase() } }
     }
     #[test] fn settings_roundtrip() {
-        let s = Settings { launcher_pos: Some((-1200, 300)), ..Default::default() };
+        let s = Settings { max_recent: 12, ..Default::default() };
         let j = serde_json::to_string_pretty(&s).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&j).unwrap(), s);
         // 缺字段、多出未知字段的旧配置也必须能读，且已有字段保留

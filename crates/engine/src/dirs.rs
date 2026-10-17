@@ -28,10 +28,12 @@ pub(crate) fn scan() -> Vec<DirEntry> {
         (&FOLDERID_Pictures, "图片"),
         (&FOLDERID_Videos, "视频"),
     ];
+    let mut seen_names: HashSet<String> = HashSet::new();
     for (guid, name) in fixed {
         if let Some(p) = win::known_folder(guid) {
             if seen.insert(p.to_string_lossy().to_lowercase()) {
                 let count = count_entries(&p);
+                seen_names.insert(name.to_string());
                 out.push(DirEntry { path: p, name: name.to_string(), count });
             }
         }
@@ -39,7 +41,8 @@ pub(crate) fn scan() -> Vec<DirEntry> {
     if let Some(desktop) = win::known_folder(&FOLDERID_Desktop) {
         for name in DESKTOP_SUBDIRS {
             let p = desktop.join(name);
-            if p.is_dir() && seen.insert(p.to_string_lossy().to_lowercase()) {
+            // 与固定目录重名的分类目录不收录（显示名重复，见 docs/questions.md #29）
+            if p.is_dir() && seen_names.insert(name.to_string()) && seen.insert(p.to_string_lossy().to_lowercase()) {
                 let count = count_entries(&p);
                 out.push(DirEntry { path: p, name: name.to_string(), count });
             }

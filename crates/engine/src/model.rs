@@ -142,9 +142,6 @@ pub struct Settings {
     pub max_recent: u32,
     /// v0.1 只实现 Light；Dark 存在但 UI 按 Light 绘制。
     pub theme: Theme,
-    /// 角标按钮 40×40 主体（不含阴影边距）左上角，虚拟屏幕物理像素。None = 默认位置。
-    pub launcher_pos: Option<(i32, i32)>,
-    pub grid_snap: bool,
     pub first_run_done: bool,
     /// 最近文件的显示方式。
     pub files_view: ViewMode,
@@ -160,8 +157,6 @@ impl Default for Settings {
             autostart: false,
             max_recent: 8,
             theme: Theme::Light,
-            launcher_pos: None,
-            grid_snap: true,
             first_run_done: false,
             files_view: ViewMode::Grid,
             dirs_view: ViewMode::Grid,

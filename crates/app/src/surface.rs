@@ -114,6 +114,9 @@ impl Surface {
                         ULW_ALPHA,
                     );
                     let _ = gdi.ReleaseDC(None);
+                    if r.is_err() {
+                        deskpad_engine::log::warn(&format!("UpdateLayeredWindow failed: {:?}", r));
+                    }
                     r
                 }
                 Err(e) => Err(e),
