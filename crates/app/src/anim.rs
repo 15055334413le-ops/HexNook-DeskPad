@@ -62,7 +62,7 @@ pub fn start_open(app: &mut App) {
 /// 动画关闭路径下直接到终态。
 pub fn finish_open(app: &mut App) {
     app.pad_alpha = 255;
-    app.scrim_alpha = 77;
+    app.scrim_alpha = if app.glass_active { 0 } else { 77 };
     app.anim = None;
 }
 
@@ -87,7 +87,7 @@ pub fn tick(app: &mut App) -> bool {
             let t = ease_out_cubic(ms as f32 / OPEN_MS as f32);
             let alpha = (255.0 * t) as u8;
             app.pad_alpha = alpha;
-            app.scrim_alpha = (77.0 * t) as u8;
+            app.scrim_alpha = if app.glass_active { 0 } else { (77.0 * t) as u8 };
             // y 从 +8 DIP 移到 0
             let dy = ((1.0 - t) * 8.0 * app.scale()).round() as i32;
             let mut p = base_origin(app);
@@ -104,7 +104,7 @@ pub fn tick(app: &mut App) -> bool {
             let t = 1.0 - (ms as f32 / CLOSE_MS as f32).clamp(0.0, 1.0);
             let alpha = (255.0 * t) as u8;
             app.pad_alpha = alpha;
-            app.scrim_alpha = (77.0 * t) as u8;
+            app.scrim_alpha = if app.glass_active { 0 } else { (77.0 * t) as u8 };
             let _ = app.pad_surface().set_alpha_and_pos(app.pad, base_origin(app), alpha);
             crate::pad::set_scrim_alpha(app, app.scrim_alpha);
             if ms >= CLOSE_MS {

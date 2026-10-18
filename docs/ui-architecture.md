@@ -108,6 +108,8 @@ pub const SELECT_BG: u32 = 0xFFEAF2FF;      // 选中 / 浅蓝背景
 pub const ROW_HOVER: u32 = 0xFFF7F7F7;      // 文件行 hover
 pub const DANGER: u32 = 0xFFD93025;         // 错误提示文字；tofour 文档定义了 Danger 色时以文档为准
 pub const SCRIM: u32 = 0x4D0F121A;          // 背景幕 rgba(15,18,26,0.30)
+pub const GLASS_SURFACE: u32 = 0xCCFAFAFA;  // Glass 面板半透明白
+pub const GLASS_BORDER: u32 = 0xE6FFFFFF;   // Glass 面板 1px 白色高光
 // 圆角（4 的倍数递进；连续曲率，见 4.3）
 pub const RADIUS_CARD: f32 = 10.0;          // 启动台三大面板
 pub const RADIUS_INPUT: f32 = 6.0;          // 搜索框
@@ -137,10 +139,10 @@ pub const GAP_CARD: f32 = 16.0;    // 三块面板之间
 
 | 组件 | tofour 规范 |
 |---|---|
-| 背景幕 | **纯半透明深色遮罩 `SCRIM`，不加模糊**（毛玻璃被禁） |
-| 三块面板 | `SURFACE` 填充 + `1px BORDER` 边框 + `RADIUS_CARD` 连续曲率 + L3 阴影 |
+| 背景幕 | Flat：纯半透明深色遮罩 `SCRIM`，外观不变；Glass：Win11 公开 DWM 系统背景材料，失败时静默回退 Flat |
+| 三块面板 | Flat：`SURFACE` + `1px BORDER` + `RADIUS_CARD` + L3；Glass：`GLASS_SURFACE` + `1px GLASS_BORDER` |
 | 搜索框 | `INPUT` + `1px BORDER` + 内阴影 `SHADOW_INPUT` + `RADIUS_INPUT`；**聚焦时边框变 `PRIMARY`**（启动台显示期间搜索框始终处于聚焦态）；placeholder「搜索应用」用 `TEXT_TERTIARY` |
-| 应用格 | 默认无底无边。**Hover**：`INPUT` 白底 `RADIUS_ITEM` + L2 阴影，图标上移 2px。**键盘选中**：`1px PRIMARY` 边框 + `SELECT_BG` 底。两种状态同时成立时，用选中样式并保留上移 |
+| 应用格 | 默认无底无边。**Hover**：`INPUT` 白底 `RADIUS_ITEM` + L2 阴影，图标上移 2px。**键盘选中**：`1px PRIMARY` 边框 + `SELECT_BG` 底。两种状态同时成立时，用选中样式并保留上移。**icon_style=Unified**：图标画在 62×62 白色（`INPUT`）连续曲率 `RADIUS_CARD` 底板上，`1px BORDER` 描边 + L1 阴影，原图标等比缩到 40×40 居中；`Native` 时直接画原图标 |
 | 文件行 | 文件名 `TEXT_PRIMARY`、时间 `TEXT_TERTIARY`（`FS_SMALL`）；Hover 时 `ROW_HOVER` 圆角行；类型色块用内容色（6.7 表） |
 | 文件夹格 | `INPUT` 白底 + `1px BORDER` + `RADIUS_ITEM`；Hover 时 `SELECT_BG` 背景、名称变 `PRIMARY` |
 | 面板标题 | `FS_TITLE` / 600 / `TEXT_PRIMARY`；计数等辅助信息 `FS_CAPTION` / `TEXT_SECONDARY` |
@@ -165,6 +167,7 @@ pub const GAP_CARD: f32 = 16.0;    // 三块面板之间
   4. `UpdateLayeredWindow(ULW_ALPHA, BLENDFUNCTION{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA})`。
 - 只在数据或交互变化时重绘，空闲时不跑任何定时器（光标闪烁定时器只在启动台显示期间存在）。
 - `EndDraw` 返回 `D2DERR_RECREATE_TARGET` 时，重建 RT 和所有设备相关位图，再重绘一次。
+- Glass 不在本进程截屏或模糊：遮罩去掉 `WS_EX_LAYERED`，调用 `DwmExtendFrameIntoClientArea(-1,-1,-1,-1)` 与 `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)`，由 DWM 合成器模糊桌面。任一调用失败（含 Win10）时恢复分层 `SCRIM` 并按 Flat 渲染。
 
 ## 5. 与 Windows 协调（行为层，像系统自带功能一样）
 
@@ -261,11 +264,13 @@ pub const GAP_CARD: f32 = 16.0;    // 三块面板之间
 
 | 窗口 | 类名 | 样式 | 内容 |
 |---|---|---|---|
-| 背景幕 | `DeskPadScrim` | `WS_POPUP`；`WS_EX_LAYERED \| WS_EX_TOOLWINDOW \| WS_EX_TOPMOST \| WS_EX_NOACTIVATE` | 类背景刷 `CreateSolidBrush(RGB(15,18,26))`；透明度由 `SetLayeredWindowAttributes(LWA_ALPHA, 77)` 设置（77 = 0.30×255）；铺满鼠标所在显示器的 **rcWork** |
+| 背景幕 | `DeskPadScrim` | `WS_POPUP`；Flat 使用 `WS_EX_LAYERED \| WS_EX_TOOLWINDOW \| WS_EX_TOPMOST \| WS_EX_NOACTIVATE`，Glass 去掉 `WS_EX_LAYERED` | Flat：`SCRIM` + `SetLayeredWindowAttributes(...,77)`；Glass：透明客户区 + DWM 系统背景材料；均铺满鼠标所在显示器的 **rcWork**；DWM 失败恢复 Flat |
 | 内容 | `DeskPadPad` | `WS_POPUP`；`WS_EX_LAYERED \| WS_EX_TOOLWINDOW \| WS_EX_TOPMOST`；**owner = 背景幕窗口**（从而始终位于背景幕之上） | 三块面板，用 UpdateLayeredWindow 推送；窗口矩形 = 面板外接矩形向四周扩 `SHADOW_MARGIN` |
 
 - 背景幕窗口处理 `WM_MOUSEACTIVATE` 时返回 `MA_NOACTIVATE`；收到 `WM_LBUTTONDOWN` 或 `WM_RBUTTONDOWN` → `hide(HideReason::ClickOutside)`。
 - 内容窗口中 alpha=0 的像素会让鼠标点击穿透到背景幕，背景幕负责关闭，**不需要额外的命中测试**。
+- 内容窗口 `DragAcceptFiles(TRUE)`；`WM_DROPFILES` 收到后过滤 `.exe` / `.lnk` / `.url`，逐个 `eng.add_manual_app`，成功后记 `pending_drop`，快照到达后高亮新项 1 秒（`DROP_TIMER`，`hide` 时一并 Kill）。
+- 引擎快照到达（`WM_APP_SNAPSHOT`）时重新取 `settings` / `snapshot`、重算布局并重绘，`sort_mode` / `show_system_tools` / `hidden_apps` 的变化因此立即生效。
 
 **show(reason)：**
 
@@ -317,6 +322,7 @@ dirs_card = (files_card.x, files_card.bottom + GAP_CARD, right_w, content_h − 
   - 放不下的行直接不显示（v0.1 不做滚动）。
 - `hit_test(pt) -> Hit::{ App(usize 可见下标) | File(usize) | Dir(usize) | Search | Card | None }`。`Card` 表示点在面板空白处（不关闭）；`None` 不会出现，因为透明区域的点击已经穿透给背景幕。
 - **单元测试**：1920×1040 和 1024×640 两种工作区下，面板之间不重叠、全部位于工作区内、cell_w > 62。
+- **pad_size=Fullscreen**：`content` 外扩 `SHADOW_MARGIN` 后正好铺满 rcWork；应用网格列数 = `max(6, floor((grid_w + GAP) / (128 + GAP)))`，列宽按可用宽度均分；右侧文件 / 文件夹卡宽度上限仍按 `right_w` 规则（≤320）。单元测试覆盖 1080p / 1440p / 4K × 100% / 150%。
 
 ### 6.7 render.rs / surface.rs / icons.rs
 
@@ -325,7 +331,7 @@ dirs_card = (files_card.x, files_card.bottom + GAP_CARD, right_w, content_h − 
 1. `Clear(透明)`。
 2. 三块面板：`drawSoftShadow(L3)` → `fillSmoothRect(SURFACE)` → `drawSmoothRect(BORDER, 1px)`。
 3. 搜索框：白底、内阴影、聚焦边框；文字 `FS_BODY`；光标为 1px×18 的 `TEXT_PRIMARY` 竖线；query 为空时显示 placeholder。
-4. 应用网格：按 4.2 画 hover / 选中状态 → 图标 → 名称。图标还没加载好或 icon_png 为 None 时，画一个 `BORDER` 色的 62px 平滑圆角方块占位。
+4. 应用网格：按 4.2 画 hover / 选中状态 → 图标 → 名称。图标还没加载好或 icon_png 为 None 时，画一个 `BORDER` 色的 62px 平滑圆角方块占位；`icon_style=Unified` 时按 4.2 的 Unified 底板画法。
 5. 文件行：hover 背景 → 类型色块（扩展名转大写，最多 4 个字符，`FS_SMALL`/600/白色，居中）→ 文件名 → 时间。
 6. 文件夹格：白底、边框 → 文件夹图形（`ICON` 色，用 D2D 路径画：上方小标签 + 圆角矩形）→ 名称 → 计数。
 7. 状态文字（应用卡网格区域居中，`FS_BODY`/`TEXT_SECONDARY`）：
@@ -371,11 +377,13 @@ dirs_card = (files_card.x, files_card.bottom + GAP_CARD, right_w, content_h − 
 | `WM_MOUSELEAVE` | 清除 hover |
 | `WM_MOUSEWHEEL` | 每 120 单位滚动一行（应用区） |
 | `WM_LBUTTONUP` | **抬起时触发，不是按下时**：App 项 → 启动；File / Dir 项 → open_path；`Search` / `Card` → 不做任何事 |
+| `WM_RBUTTONUP` | 命中 App 项时弹系统右键菜单（见下） |
 
 - **执行动作**：
   - 应用：`eng.launch_app(id, &query)`；
   - 文件或文件夹：`eng.open_path(&path)`；
   - 成功 → `hide(Launch)`；失败 → 显示错误条，启动台保持打开。
+- **应用右键菜单**：命中 App 项时用 `CreatePopupMenu` + `TrackPopupMenuEx(TPM_RIGHTBUTTON \| TPM_RETURNCMD)` 弹出【打开 / 以管理员身份运行（仅 `exe` / `lnk`，`ShellExecuteW("runas")`）/ 打开文件位置 / 隐藏（`eng.set_hidden`）】；菜单打开期间置 `context_menu_open`，`WM_ACTIVATE(WA_INACTIVE)` 不隐藏启动台。
 - **输入法**：
   - 内容窗口不调用 `ImmAssociateContextEx` 禁用输入法，保持默认上下文；
   - 每次重绘后，以及处理 `WM_IME_STARTCOMPOSITION` 时，调用 `ImmGetContext` → `ImmSetCompositionWindow(CFS_POINT, 光标位置)` 和 `ImmSetCandidateWindow(CFS_CANDIDATEPOS, 光标下沿)` → `ImmReleaseContext`。坐标是窗口客户区内的物理像素。
@@ -384,7 +392,7 @@ dirs_card = (files_card.x, files_card.bottom + GAP_CARD, right_w, content_h − 
 ### 6.9 anim.rs
 
 - 所有动画都由 `SetTimer(内容窗口, ID_ANIM, 15)` 推进，**只调用 `set_alpha_and_pos`，不重绘**。
-- **打开**：120ms，ease-out-cubic；内容窗口 alpha 0→255，y 从 +8 DIP 移到 0；背景幕 alpha 0→77。
+- **打开**：120ms，ease-out-cubic；内容窗口 alpha 0→255，y 从 +8 DIP 移到 0；背景幕 alpha 0→77（Glass 时恒 0，透明客户区由 DWM 合成）。
 - **关闭**（非 Launch）：80ms，alpha 降到 0，然后隐藏。
 - `SPI_GETCLIENTAREAANIMATION == FALSE` 时直接跳到终态（5-#10）。
 - 动画结束后 `KillTimer`。
@@ -414,25 +422,26 @@ Windows 没有给第三方应用"往任务栏里加按钮"的公开接口：老�
   - 消失后执行 `first_run_done = true; save_settings`。
 ### 6.11 settings_ui.rs — 设置窗口
 
-- 窗口：分层窗口，tofour Modal 样式（白底 + `RADIUS_MODAL` + L3 阴影），主体 420×320 DIP，居中显示在鼠标所在显示器；`WS_EX_TOOLWINDOW`，不加 TOPMOST。
+- 窗口：分层窗口，tofour Modal 样式（白底 + `RADIUS_MODAL` + L3 阴影），主体 680×500 DIP，居中显示在鼠标所在显示器；`WS_EX_TOOLWINDOW`，不加 TOPMOST。
 - 同一时间只存在一个设置窗口，重复打开时激活已有的那个。打开设置窗口时，启动台先隐藏。
+- 布局：左侧 160 DIP 分区导航（通用 / 外观 / 应用 / 更新 / 关于），右侧 496 DIP 内容区；每个分区内是「分组标题 + 48 DIP 设置行」，左侧标题与一行 `TEXT_SECONDARY` 说明，右侧是开关、分段按钮、次要按钮或 1..=20 步进器。内容超出时右侧画 4 DIP 细滚动条。
 - **布局**（距主体左边 24 DIP）：
   1. Header：标题「设置」（`FS_TITLE`/600），右上角 × 按钮，下方 1px `BORDER` 分隔线。按住 Header 可以拖动窗口。
-  2. 快捷键：3 个单选项（`HotkeyPreset::ALL`，显示 `label()`），下方是说明文字（6.3），以及冲突时的行内错误。
-  3. 开机自启：勾选框 →「开机时自动启动」。
-  4. 首次引导：次要按钮 [重新显示引导]。
-  5. Footer：上方 1px 分隔线，右对齐 [取消]（次要按钮）和 [保存]（主按钮）。
+  2. 通用：快捷键三选一分段按钮、开机自启开关、重新显示首次引导按钮。
+  3. 外观：主题（扁平 / 毛玻璃）、启动台大小（窗口 / 全屏）、图标样式（原生 / 统一）、最近文件视图、常用文件夹视图、最近文件数量。
+  4. 应用：显示系统工具开关、排序（名称 / 使用频率）、管理隐藏的应用、额外扫描的文件夹、手动添加的应用。手动应用选择框接受 `.exe` / `.lnk` / `.url`，与引擎和拖入添加一致。
+  5. 更新：当前版本、状态（已是最新 / 发现新版本 / 正在检查 / 错误）、检查更新或立即更新、自动检查更新开关；沿用 0.2.0 的一次性检查子进程。
+  6. 关于：HN DeskPad、当前版本、发布页链接、打开日志文件夹。
 - **控件样式**：
   - 主按钮：`PRIMARY` 底、白字、高 32、`RADIUS_INPUT`，hover 用 `PRIMARY_HOVER`，按下用 `PRIMARY_PRESSED`；
   - 次要按钮：白底 + 1px `BORDER`，文字 `TEXT_PRIMARY`；
-  - 勾选框和单选框：16px，选中时填充 `PRIMARY`；
+  - 开关：36×20 DIP 平滑圆角轨道 + 16 DIP 圆钮，开态 `PRIMARY`；
+  - 分段按钮：沿用启动台卡片右上角视图切换；
   - 键盘焦点环：1px `PRIMARY`，与控件间隔 2px。
-- **键盘**：Tab / Shift+Tab 切换控件，Space 切换勾选，Enter = 保存，Esc = 取消。
-- **保存**：
-  1. 热键有变化 → `hotkey::change`，失败时停在窗口上并显示错误；
-  2. `eng.save_settings`；
-  3. 点过重新显示引导 → `first_run_done = false`，弹出气泡；
-  4. 关闭窗口。
+  - 颜色只用 theme.rs 已有 Token，不新增 palette 项。
+- **键盘**：Tab / Shift+Tab 依可视顺序切换控件；↑/↓ 切换分区；←/→ 在分段按钮内移动并立即应用；Space / Enter 触发聚焦控件；Esc 关闭。
+- **即时生效**：没有「取消 / 保存」。每次控件改动立刻调用 `eng.save_settings`；热键先 `hotkey::change`，失败时行内显示错误并回退，保存失败也回退已注册热键。启动台在下一次 `pad::show` / `prepare_frame` 前重读设置，保证 DP04b 的毛玻璃、尺寸、图标、视图、最近数量、系统工具、排序等消费者一致。
+- **无头验收**：`DeskPad.exe --render-test --settings <general|appearance|apps|update|about> [--out <path>]`，150% 缩放离屏绘制一个分区并写 PNG；该模式不创建窗口、不占单实例锁。
 
 ### 6.12 glyph.rs — 产品图形
 

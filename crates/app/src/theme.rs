@@ -16,6 +16,10 @@ pub const SELECT_BG: u32 = 0xFFEAF2FF;      // 选中 / 浅蓝背景
 pub const ROW_HOVER: u32 = 0xFFF7F7F7;      // 文件行 hover
 pub const DANGER: u32 = 0xFFD93025;         // 错误提示文字
 pub const SCRIM: u32 = 0x4D0F121A;          // 背景幕 rgba(15,18,26,0.30)
+/// Glass 主题面板：半透明白，系统背景材料可透出。
+pub const GLASS_SURFACE: u32 = 0xCCFAFAFA;
+/// Glass 主题面板的 1px 白色高光描边。
+pub const GLASS_BORDER: u32 = 0xE6FFFFFF;
 /// 任务栏启动按钮的命中区填充：3% 黑，肉眼不可见，但让整块 28 DIP 都能接收点击
 /// （questions.md #33）。分层窗口按像素 alpha 判定命中，四块图形之间 alpha=0 的
 /// 缝隙会把点击漏给任务栏。
@@ -50,7 +54,7 @@ pub fn eager_palette() -> Vec<u32> {
     vec![
         PRIMARY, PRIMARY_HOVER, PRIMARY_PRESSED, BACKGROUND, SURFACE, INPUT,
         TEXT_PRIMARY, TEXT_SECONDARY, TEXT_TERTIARY, BORDER, BORDER_HOVER,
-        ICON, SELECT_BG, ROW_HOVER, DANGER,
+        ICON, SELECT_BG, ROW_HOVER, DANGER, GLASS_SURFACE, GLASS_BORDER,
         0x0A000000, 0xFFFFFFFF, 0xFFFF0000,
         // 文件类型色块内容色
         0xFF2B579A, 0xFF217346, 0xFFD24726, 0xFFD93025, 0xFF8E5BD8,

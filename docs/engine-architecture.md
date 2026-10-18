@@ -103,6 +103,8 @@ pub enum LaunchTarget {
 pub enum AppSource {
     StartMenu,
     Desktop,
+    ExtraScanDir,
+    Manual,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,6 +118,15 @@ pub struct AppEntry {
     pub source: AppSource,
     /// 引擎内部用于搜索与排序的派生键，UI 不得解析。
     pub keys: SearchKeys,
+    /// 是否为 Windows 管理/维护工具；日常应用不算。
+    #[serde(default)]
+    pub is_system: bool,
+    /// 是否在 settings.hidden_apps 中；只用于 all_apps 的管理视图。
+    #[serde(default)]
+    pub hidden: bool,
+    /// hidden_apps 使用的小写稳定键；扫描时预先计算。
+    #[serde(default)]
+    pub setting_id: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +211,39 @@ pub enum Theme {
     Dark,
 }
 
+/// 启动台主体视觉风格。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VisualStyle {
+    #[default]
+    Flat,
+    Glass,
+}
+
+/// 启动台尺寸。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PadSize {
+    #[default]
+    Window,
+    Fullscreen,
+}
+
+/// 应用图标呈现方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IconStyle {
+    #[default]
+    Native,
+    Unified,
+}
+
+/// 启动台应用排序方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortMode {
+    #[default]
+    Name,
+    /// 按 30 天半衰期的启动频率分排序。
+    Frequency,
+}
+
 pub const SETTINGS_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -220,6 +264,15 @@ pub struct Settings {
     /// 打开启动台时是否自动检查更新（距上次 ≥24 小时才真正发起，questions.md #35）。
     /// serde default = true，旧 config.json 缺这个字段也能读。
     pub auto_check_update: bool,
+    pub visual_style: VisualStyle,
+    pub pad_size: PadSize,
+    pub icon_style: IconStyle,
+    pub show_system_tools: bool,
+    /// AppsFolder parsing name 或快捷方式目标路径，统一小写。
+    pub hidden_apps: Vec<String>,
+    pub extra_scan_dirs: Vec<PathBuf>,
+    pub manual_apps: Vec<PathBuf>,
+    pub sort_mode: SortMode,
 }
 
 impl Default for Settings {
@@ -233,6 +286,14 @@ impl Default for Settings {
 
             first_run_done: false,
             auto_check_update: true,
+            visual_style: VisualStyle::Flat,
+            pad_size: PadSize::Window,
+            icon_style: IconStyle::Native,
+            show_system_tools: false,
+            hidden_apps: Vec::new(),
+            extra_scan_dirs: Vec::new(),
+            manual_apps: Vec::new(),
+            sort_mode: SortMode::Name,
         }
     }
 }
@@ -243,7 +304,9 @@ pub struct Snapshot {
     pub generation: u64,
     /// false = 首次扫描尚未完成（UI 显示「正在读取应用…」）。
     pub ready: bool,
-    /// 已按 keys.sort_key 升序排列（空查询时的显示顺序）。
+    /// 未过滤的全量应用，隐藏项带 hidden=true，供设置页管理。
+    pub all_apps: Arc<Vec<AppEntry>>,
+    /// 已按 settings.sort_mode 排序的可见应用。
     pub apps: Arc<Vec<AppEntry>>,
     /// 已排序：mtime 降序，截断到 settings.max_recent。
     pub recent: Arc<Vec<FileEntry>>,
@@ -288,6 +351,8 @@ use std::collections::HashMap;
 pub struct Usage {
     /// 每个应用经 DeskPad 启动的次数。
     pub launch_counts: HashMap<AppId, u32>,
+    /// 每个应用最后一次成功启动的 Unix 秒时间。
+    pub last_launched: HashMap<AppId, i64>,
     /// 规范化查询串 → 用户上一次从该查询启动的应用。
     pub query_picks: HashMap<String, AppId>,
 }
@@ -482,8 +547,17 @@ impl EngineHandle {
     pub fn settings(&self) -> Settings;
 
     /// 钳制字段 → 原子写 config.json → autostart 变化时写注册表 →
-    /// max_recent 变化时触发 FILES 重扫。
+    /// 应用视图变化立即发布；扫描目录/手动应用变化触发 APPS 重扫。
     pub fn save_settings(&self, s: &Settings) -> Result<(), EngineError>;
+
+    /// 以稳定 setting_id 隐藏/取消隐藏；触发 APPS 重扫并发布新 Snapshot。
+    pub fn set_hidden(&self, id: &str, hidden: bool) -> Result<(), EngineError>;
+    /// 添加/移除手动 exe、lnk、url；成功保存后触发 APPS 重扫。
+    pub fn add_manual_app(&self, path: &std::path::Path) -> Result<(), EngineError>;
+    pub fn remove_manual_app(&self, path: &std::path::Path) -> Result<(), EngineError>;
+    /// 添加/移除额外目录；网络盘拒绝添加；成功保存后触发 APPS 重扫。
+    pub fn add_scan_dir(&self, path: &std::path::Path) -> Result<(), EngineError>;
+    pub fn remove_scan_dir(&self, path: &std::path::Path) -> Result<(), EngineError>;
 
     /// 通知后台线程退出并 join，最多等 1 秒。UI 在退出前调用。
     pub fn shutdown(&self);
@@ -526,6 +600,12 @@ loop  enum.Next(&mut [None; 1], Some(&mut fetched))，fetched == 0 时结束：
     launch  = LaunchTarget::AppsFolder(parsing)
 ```
 
+系统工具判定在扫描时完成，结果写入 `AppEntry.is_system`：
+
+- 快捷方式位于开始菜单 `Administrative Tools` / `Windows Tools` 目录，或 shell 链接属性 `System.Link.TargetParsingPath` 指向这些目录中的快捷方式目标；
+- 或目标 exe 位于 `%SystemRoot%`（含 System32 / SysWOW64）且文件名命中内置名单：`odbcad32`、`regedit`、`msconfig`、`perfmon`、`eventvwr`、`compmgmt`、`services`、`taskschd`、`dfrgui`、`cleanmgr`、`iscsicpl`、`msinfo32`、`resmon`、`recoverydrive`、`mdsched`、`secpol`、`gpedit`、`diskmgmt`、`printmanagement`、`comexp`、`wf` 等。
+- 记事本、画图、计算器、终端、设置等日常应用不算系统工具。
+
 #### 4.1.2 来源 B：桌面快捷方式（AppSource::Desktop）
 
 - 扫描目录：`FOLDERID_Desktop` 和 `FOLDERID_PublicDesktop`，**只看顶层，不递归**。
@@ -537,16 +617,29 @@ loop  enum.Next(&mut [None; 1], Some(&mut fetched))，fetched == 0 时结束：
 - name = 文件名去掉扩展名，再去掉末尾的 ` - 快捷方式` 或 ` - Shortcut`（不区分大小写）。
 - launch = `LaunchTarget::Shortcut(完整路径)`。
 
+**来源 C：额外扫描目录（AppSource::ExtraScanDir）**
+
+- 对 `settings.extra_scan_dirs` 的每个本地目录扫描根目录与一级子目录，只收 `.exe` / `.lnk` / `.url`。
+- 不递归更深层；名称含 `卸载` / `uninstall` 的子目录跳过；UNC 与 `DRIVE_REMOTE` 网络盘跳过。
+- 额外目录及其一级子目录用 `FindFirstChangeNotificationW` 监听，设置变化后重建监听集合，不轮询。
+
+**来源 D：手动应用（AppSource::Manual）**
+
+- 只接受存在的 `.exe` / `.lnk` / `.url`；`.url` 的 `URL=` scheme 不是 `http` / `https` / `file` 时视为应用，否则不进入启动台；设置保存后走同一条 APPS 重扫路径。
+
 #### 4.1.3 过滤、去重、id
 
 - **过滤**（name 转小写后判断）：
   - 含 `卸载`、`帮助`、`说明`、`官网` 之一 → 丢弃；
   - 按空格和标点切词后，出现 `uninstall`、`readme`、`help`、`documentation`、`manual`、`website` 之一 → 丢弃；
   - alias 以 `unins` 开头 → 丢弃。
-- **去重**：来源 B 的条目，如果 name 小写和来源 A 中任何一项的 name 小写相同 → 丢弃来源 B 的那一项。来源 A 内部不需要去重。
+- **去重**：按来源优先级 A → B → C → D；后来源中 name 小写与前面任一项相同 → 丢弃。来源 A 内部不需要去重。
 - **id**：`fnv1a64(key.as_bytes())`。来源 A 的 key = `"af:" + parsing.to_lowercase()`，来源 B 的 key = `"sc:" + 完整路径.to_lowercase()`。FNV-1a 64 位（offset basis `0xcbf29ce484222325`，prime `0x100000001b3`）自己写，放在 `keys.rs`。**禁止使用 `DefaultHasher`**，它的算法不保证跨 Rust 版本稳定。
-- **排序**：按 `keys.sort_key` 升序；sort_key 相同时按 name 升序。
+- **setting_id**：AppsFolder 用 parsing name 小写；快捷方式用目标路径小写（解析失败时退回快捷方式路径）；额外目录/手动应用用完整文件路径小写。
+- **排序**：`SortMode::Name` 按 `keys.sort_key` 升序，再按 name 升序。`SortMode::Frequency` 按启动次数乘 30 天半衰期衰减系数降序：`count × 0.5^(age_days / 30)`，同分再按最后启动时间、启动次数与名称稳定排序。
 - 耗时参考：300 个应用约 100～300ms，在扫描线程上执行。
+
+**Snapshot 投影**：每次发布前按当前设置重新生成两份列表。`all_apps` 是全量列表，按 `hidden_apps` 设置 `hidden`；`apps` 去掉 `hidden=true` 的项，并在 `show_system_tools=false` 时去掉 `is_system=true` 的项。两份列表使用同一排序规则。
 
 #### 4.1.4 keys.rs — SearchKeys 计算
 
@@ -683,8 +776,9 @@ keys.rs 必须包含以下单元测试（仅 `#[cfg(windows)]` 下运行）：�
 `launch_app` 成功后：
 
 1. `usage.launch_counts[id] += 1`；
-2. `normalize_query(from_query)` 非空时，`usage.query_picks[q] = id`；
-3. 原子写入 usage.json，失败只记 warn。
+2. `usage.last_launched[id] = 当前 Unix 秒`；
+3. `normalize_query(from_query)` 非空时，`usage.query_picks[q] = id`；
+4. 原子写入 `%LOCALAPPDATA%\DeskPad\usage.json`，失败只记 warn；Frequency 模式下立即重投影并发布 Snapshot。
 
 `launch_app` 传入的 id 在当前快照里找不到 → `Err(UnknownApp(id))`。
 
@@ -696,10 +790,10 @@ keys.rs 必须包含以下单元测试（仅 `#[cfg(windows)]` 下运行）：�
 |---|---|---|
 | `config.json` | `Settings`（serde_json 美化输出） | 回退到 `Settings::default()`，把坏文件改名为 `config.bad.json`，记 warn |
 | `usage.json` | `search::Usage` | 回退到默认值 |
-| `index.json` | `{ "version": 1, "apps": Vec<AppEntry> }` | 忽略，视为首次运行 |
+| `index.json` | `{ "version": 2, "apps": Vec<AppEntry> }` | 旧版本或解析失败均忽略，视为首次运行 |
 | `log.txt` / `log.old.txt` | 日志 | — |
 
-- **原子写**：先写 `xxx.tmp`，flush 后用 `std::fs::rename` 覆盖正式文件（Windows 上底层是 MoveFileEx + REPLACE_EXISTING）。
+- **原子写**：先写带进程号后缀的 `xxx.<pid>.tmp`，flush 后用 `std::fs::rename` 覆盖正式文件（Windows 上底层是 MoveFileEx + REPLACE_EXISTING），避免并发实例/线程抢同一个临时文件。
 - **加载 Settings 后钳制**：`max_recent` 限制在 1..=20；`version` 小于 `SETTINGS_VERSION` 时按迁移表升级（v0.1 没有迁移，直接把 version 改成 1）。
 - `#[serde(default)]` 保证旧配置缺字段或多出未知字段都能读，**不允许因为解析失败清空用户设置**。model.rs 里有对应的测试，必须保留。
 
@@ -742,10 +836,10 @@ struct Inner {
 2. 加载 config.json → 钳制 → 读取 autostart 真实状态并覆盖。
 3. 加载 usage.json。
 4. 加载 index.json：
-   - 存在 → 用它生成 generation=1、ready=true 的初始快照（recent/dirs 先为空）；
-   - 不存在 → 空快照，ready=false。
+   - 版本 2 且存在 → 用 `all_apps` 和当前设置的投影生成 generation=1、ready=true 的初始快照（recent/dirs 先为空）；
+   - 不存在或旧版本 → 空快照，ready=false。
 5. 启动扫描线程（4.8.2）。
-6. 如果第 4 步时 index.json 不存在：在 Condvar 上最多等 3 秒，直到第一次 APPS 阶段完成发布。超时也照常返回（ready=false，UI 显示「正在读取应用…」）。
+6. 如果第 4 步没有可用的 v2 index.json：在 Condvar 上最多等 3 秒，直到第一次 APPS 阶段完成发布。超时也照常返回（ready=false，UI 显示「正在读取应用…」）。
 7. 返回 handle。
 
 #### 4.8.2 扫描线程（只有这一个后台线程）
@@ -780,9 +874,11 @@ loop {
 | `FOLDERID_Desktop` | 否 | FILE_NAME \| DIR_NAME \| LAST_WRITE | APPS \| FILES |
 | `FOLDERID_PublicDesktop` | 否 | 同上 | APPS |
 | `FOLDERID_Recent` | 否 | FILE_NAME \| LAST_WRITE | FILES |
+| `settings.extra_scan_dirs` 及各自一级子目录 | 否 | FILE_NAME \| DIR_NAME \| LAST_WRITE | APPS |
 
 - `refresh()` → SetEvent(refresh_event)，触发 APPS | FILES。UWP 应用安装不会改动上面这些目录，靠 UI 每次打开启动台时调用 refresh 来覆盖。
 - `save_settings` 里 max_recent 变化 → 也走 refresh_event，但只设置 FILES 位（用一个 AtomicU8 存放待处理的扫描范围）。
+- 额外扫描目录变化或 add/remove API 保存设置 → 设置 APPS 位并重建目录监听；不轮询。
 - 某个目录监听失败 → 记 warn，跳过该目录，其他照常。
 
 ### 4.9 log.rs / win.rs
@@ -835,7 +931,8 @@ loop {
 `main` 开头先 `ComInit::sta()`。所有命令都输出 UTF-8 文本；出错时退出码为 1，并把错误打到 stderr。
 
 ```
-probe apps [--ids]      # 先打印 "count=N ready=true"，再逐行打印：id(16 位十六进制) | 来源 | 名称 | alias | initials | 图标:有/无
+probe apps [--ids] [--all] # 默认只列 Snapshot.apps；--all 列 all_apps，并用 [system]/[hidden] 标记
+                           # 先打印 "count=N ready=true"，再逐行打印：id | 来源 | 名称+标记 | alias | initials | 图标:有/无
 probe icons             # 等待图标补全完成（最多 60 秒），打印命中率；把缺失项逐个列出
 probe recent            # 每行：mtime(本地时间) | kind | 路径
 probe dirs              # 每行：count | 名称 | 路径

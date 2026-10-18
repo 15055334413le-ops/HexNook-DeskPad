@@ -1,5 +1,6 @@
 //! 布局计算 + 命中测试（UI 文档 6.6；单位：DIP；纯函数，有单元测试）。
-use crate::theme::{GAP, GAP_CARD, PAD_CARD};
+use crate::theme::{GAP, GAP_CARD, PAD_CARD, SHADOW_MARGIN};
+use deskpad_engine::PadSize;
 pub use deskpad_engine::ViewMode;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,6 +73,8 @@ pub const DIR_GRID_COLS: usize = 4;
 pub const GRID_GAP: f32 = 4.0;
 pub const FILE_GRID_H: f32 = 88.0;
 pub const DIR_GRID_H: f32 = 80.0;
+/// 全屏模式下每列的目标宽度；实际列宽按可用宽度均分。
+pub const APP_COL_TARGET_W: f32 = 128.0;
 /// 切换按钮：宽 52 高 24，右距卡片 16，顶距 12。
 /// 搜索框右侧设置按钮边长。
 pub const SETTINGS_BTN: f32 = 36.0;
@@ -80,28 +83,48 @@ pub const TOGGLE_H: f32 = 24.0;
 
 /// work：工作区（DIP）。返回所有矩形；应用卡内部矩形以 content 原点为基准（即已含卡片位置）。
 pub fn compute(work: RectF, max_recent: usize, dirs_len: usize, views: (ViewMode, ViewMode)) -> Layout {
-    let content_w = (work.w - 96.0).min(1120.0);
-    let content_h = (work.h - 96.0).min(720.0);
-    let content = RectF {
-        x: work.x + (work.w - content_w) / 2.0,
-        y: work.y + (work.h - content_h) / 2.0,
-        w: content_w,
-        h: content_h,
+    compute_with(work, max_recent, dirs_len, views, PadSize::Window)
+}
+
+pub fn compute_with(
+    work: RectF,
+    max_recent: usize,
+    dirs_len: usize,
+    views: (ViewMode, ViewMode),
+    pad_size: PadSize,
+) -> Layout {
+    let fullscreen = pad_size == PadSize::Fullscreen;
+    let content = if fullscreen {
+        RectF {
+            x: work.x + SHADOW_MARGIN,
+            y: work.y + SHADOW_MARGIN,
+            w: (work.w - 2.0 * SHADOW_MARGIN).max(0.0),
+            h: (work.h - 2.0 * SHADOW_MARGIN).max(0.0),
+        }
+    } else {
+        let content_w = (work.w - 96.0).min(1120.0);
+        let content_h = (work.h - 96.0).min(720.0);
+        RectF {
+            x: work.x + (work.w - content_w) / 2.0,
+            y: work.y + (work.h - content_h) / 2.0,
+            w: content_w,
+            h: content_h,
+        }
     };
-    let right_w = if content_w < 1000.0 { 280.0 } else { 320.0 };
+    let right_w = if content.w < 1000.0 { 280.0 } else { 320.0 };
     let apps_card = RectF {
         x: content.x,
         y: content.y,
-        w: content_w - GAP_CARD - right_w,
-        h: content_h,
+        w: content.w - GAP_CARD - right_w,
+        h: content.h,
     };
-    let files_h = (64.0 + max_recent as f32 * 36.0).min(content_h - GAP_CARD - 168.0);
+    let files_h = (64.0 + max_recent as f32 * 36.0).min(content.h - GAP_CARD - 168.0);
     let files_card = RectF { x: apps_card.right() + GAP_CARD, y: content.y, w: right_w, h: files_h };
     let dirs_card = RectF {
         x: files_card.x,
         y: files_card.bottom() + GAP_CARD,
         w: right_w,
-        h: content_h - files_h - GAP_CARD,
+        h: content.h - files_h - GAP_CARD,
     };
 
     // 应用卡内部（相对 content）
@@ -112,7 +135,11 @@ pub fn compute(work: RectF, max_recent: usize, dirs_len: usize, views: (ViewMode
         w: apps_card.w - 32.0,
         h: apps_card.h - 68.0 - PAD_CARD,
     };
-    let cols = 6usize;
+    let cols = if fullscreen {
+        (((grid.w + GAP) / (APP_COL_TARGET_W + GAP)).floor() as usize).max(6)
+    } else {
+        6
+    };
     let cell_w = (grid.w - 5.0 * GAP) / cols as f32;
     let cell_h = 104.0;
     let visible_rows = ((grid.h + GAP) / (cell_h + GAP)).floor() as usize;
@@ -288,6 +315,67 @@ mod t {
 
     #[test]
     fn layout_1024() { check((1024.0, 640.0)); }
+
+    /// 物理工作区换算为布局使用的 DIP；任务栏按 40 物理像素预留。
+    fn fullscreen_work(px_w: f32, px_h: f32, dpi: u32) -> Layout {
+        let scale = dpi as f32 / 96.0;
+        let work = RectF {
+            x: 0.0,
+            y: 0.0,
+            w: px_w / scale,
+            h: (px_h - 40.0) / scale,
+        };
+        compute_with(
+            work,
+            8,
+            6,
+            (ViewMode::Grid, ViewMode::Grid),
+            PadSize::Fullscreen,
+        )
+    }
+
+    #[test]
+    fn fullscreen_reflows_supported_resolutions_and_scales() {
+        for (px_w, px_h, dpi) in [
+            (1920.0, 1080.0, 96u32),
+            (1920.0, 1080.0, 144u32),
+            (2560.0, 1440.0, 96u32),
+            (2560.0, 1440.0, 144u32),
+            (3840.0, 2160.0, 96u32),
+            (3840.0, 2160.0, 144u32),
+        ] {
+            let l = fullscreen_work(px_w, px_h, dpi);
+            assert!(l.apps_card.w > 0.0);
+            assert!(l.files_card.w <= 320.0, "{px_w}x{px_h}@{dpi}: {}", l.files_card.w);
+            assert!(l.files_card.w >= 280.0);
+            assert!(l.apps_card.x >= l.work.x);
+            assert!(l.dirs_card.bottom() <= l.work.bottom() + 0.5);
+            assert!(l.files_card.x >= l.apps_card.right());
+            assert!(l.dirs_card.y >= l.files_card.bottom() - 0.5);
+            assert!(l.cell_w > 62.0, "{px_w}x{px_h}@{dpi}: {}", l.cell_w);
+            // 内容外扩阴影边距后正好覆盖工作区。
+            assert!((l.content.x - crate::theme::SHADOW_MARGIN - l.work.x).abs() < 0.01);
+            assert!((l.content.y - crate::theme::SHADOW_MARGIN - l.work.y).abs() < 0.01);
+            assert!(
+                (l.content.w + 2.0 * crate::theme::SHADOW_MARGIN - l.work.w).abs() < 0.01
+            );
+            assert!(
+                (l.content.h + 2.0 * crate::theme::SHADOW_MARGIN - l.work.h).abs() < 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn fullscreen_columns_grow_with_available_width() {
+        let fhd = fullscreen_work(1920.0, 1080.0, 96);
+        let qhd = fullscreen_work(2560.0, 1440.0, 96);
+        let uhd = fullscreen_work(3840.0, 2160.0, 96);
+        assert!(fhd.cols > 6);
+        assert!(qhd.cols > fhd.cols);
+        assert!(uhd.cols > qhd.cols);
+        assert_eq!(compute(RectF { x: 0.0, y: 0.0, w: 1920.0, h: 1040.0 }, 8, 6,
+            (ViewMode::Grid, ViewMode::Grid)).cols, 6);
+    }
 
     #[test]
     fn hit_test_basics() {

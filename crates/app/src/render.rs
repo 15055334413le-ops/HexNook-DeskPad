@@ -122,7 +122,8 @@ impl RenderCtx {
         let palette = [
             PRIMARY, PRIMARY_HOVER, PRIMARY_PRESSED, BACKGROUND, SURFACE, INPUT, TEXT_PRIMARY,
             TEXT_SECONDARY, TEXT_TERTIARY, BORDER, BORDER_HOVER, ICON, SELECT_BG, ROW_HOVER,
-            DANGER, SCRIM, HIT_SHIELD, 0x0A000000, 0xFFFFFFFF, 0xFFFF0000,
+            DANGER, SCRIM, GLASS_SURFACE, GLASS_BORDER, HIT_SHIELD, 0x0A000000, 0xFFFFFFFF,
+            0xFFFF0000,
         ];
         let chips = [
             FileKind::Document, FileKind::Spreadsheet, FileKind::Presentation, FileKind::Pdf,
@@ -167,14 +168,17 @@ impl RenderCtx {
         &mut self,
         factory: &ID2D1Factory,
         rect: D2D_RECT_F,
+        glass: bool,
     ) -> Result<()> {
         let (blur, dy, alpha) = SHADOW_L3;
         let shadow_brush_col = color(0xFF0F121A);
         // 阴影用黑色画刷（alpha 由贴图控制）
         let _ = shadow_brush_col;
         draw_soft_shadow(factory, &mut self.tiles, &self.rt, rect, RADIUS_CARD, blur, dy, alpha, self.rt.dpi_scale())?;
-        fill_smooth_rect(factory, &mut self.geo, &self.rt, rect, RADIUS_CARD, self.pal.get(SURFACE)?)?;
-        draw_smooth_rect(factory, &mut self.geo, &self.rt, rect, RADIUS_CARD, self.pal.get(BORDER)?, 1.0)?;
+        let fill = if glass { GLASS_SURFACE } else { SURFACE };
+        let border = if glass { GLASS_BORDER } else { BORDER };
+        fill_smooth_rect(factory, &mut self.geo, &self.rt, rect, RADIUS_CARD, self.pal.get(fill)?)?;
+        draw_smooth_rect(factory, &mut self.geo, &self.rt, rect, RADIUS_CARD, self.pal.get(border)?, 1.0)?;
         Ok(())
     }
 }
@@ -275,10 +279,11 @@ fn draw_pad_inner(
     let l: &Layout = &app.layout;
     let rt = ctx.rt.clone();
     let content = l.content;
+    let icon_style = app.settings.icon_style;
 
     // 1. 三块面板（阴影 → 填充 → 边框）
     for card in [l.apps_card, l.files_card, l.dirs_card] {
-        ctx.card(factory, win_rect(&card, &content))?;
+        ctx.card(factory, win_rect(&card, &content), app.glass_active)?;
     }
 
     // 2. 搜索框
@@ -375,7 +380,11 @@ fn draw_pad_inner(
             let cell = RectF { x: cell.x - content.x + SHADOW_MARGIN, y: cell.y - content.y + SHADOW_MARGIN, w: cell.w, h: cell.h };
             let is_sel = app.input.focus == FocusZone::Apps && app.input.selected == Some(idx);
             let is_hover = matches!(app.input.hover, Some(Hit::App(i)) if i == idx);
-            if is_sel {
+            let is_drop = app
+                .drop_highlight
+                .as_ref()
+                .is_some_and(|(id, until)| *id == entry.id && *until > std::time::Instant::now());
+            if is_sel || is_drop {
                 // 选中：1px PRIMARY 边框 + SELECT_BG（内层圆角 = 面板 10 − 4 = 6）
                 fill_smooth_rect(factory, &mut ctx.geo, &rt, to_d2d(&cell), RADIUS_ITEM, ctx.pal.get(SELECT_BG)?)?;
                 draw_smooth_rect(factory, &mut ctx.geo, &rt, to_d2d(&cell), RADIUS_ITEM, ctx.pal.get(PRIMARY)?, 1.0)?;
@@ -385,16 +394,23 @@ fn draw_pad_inner(
                 fill_smooth_rect(factory, &mut ctx.geo, &rt, to_d2d(&cell), RADIUS_ITEM, ctx.pal.get(INPUT)?)?;
             }
             // 图标 62×62，水平居中，距格顶 10；hover/选中时上移 2px
-            let up = if is_hover || is_sel { 2.0 } else { 0.0 };
+            let up = if is_hover || is_sel || is_drop { 2.0 } else { 0.0 };
             let ir = icon_rect(&cell, up);
             let bitmap = ctx.icons.get(&rt, &ctx.wic, entry);
-            match bitmap {
-                Some(bmp) => {
-                    // SAFETY: 位图由 icons 缓存持有，绘制期间有效。
-                    unsafe { rt.DrawBitmap(&bmp, Some(&D2D_RECT_F { left: ir.x, top: ir.y, right: ir.x + ir.w, bottom: ir.y + ir.h }), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+            match icon_style {
+                deskpad_engine::IconStyle::Native => {
+                    match bitmap {
+                        Some(bmp) => {
+                            // SAFETY: 位图由 icons 缓存持有，绘制期间有效。
+                            unsafe { rt.DrawBitmap(&bmp, Some(&D2D_RECT_F { left: ir.x, top: ir.y, right: ir.x + ir.w, bottom: ir.y + ir.h }), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+                        }
+                        None => {
+                            fill_smooth_rect(factory, &mut ctx.geo, &rt, to_d2d(&ir), RADIUS_ITEM, ctx.pal.get(BORDER)?)?;
+                        }
+                    }
                 }
-                None => {
-                    fill_smooth_rect(factory, &mut ctx.geo, &rt, to_d2d(&ir), RADIUS_ITEM, ctx.pal.get(BORDER)?)?;
+                deskpad_engine::IconStyle::Unified => {
+                    draw_unified_app_icon(ctx, factory, &rt, &ir, bitmap.as_ref())?;
                 }
             }
             // 名称
@@ -522,6 +538,55 @@ fn draw_pad_inner(
 /// 图标矩形：62×62，水平居中，距格顶 10；up 为上移量。
 fn icon_rect(cell: &RectF, up: f32) -> RectF {
     RectF { x: cell.x + (cell.w - 62.0) / 2.0, y: cell.y + 10.0 - up, w: 62.0, h: 62.0 }
+}
+
+/// Unified 图标：62×62 白色连续曲率底板 + L1 阴影，原图标等比缩到 40×40 居中。
+fn draw_unified_app_icon(
+    ctx: &mut RenderCtx,
+    factory: &ID2D1Factory,
+    rt: &ID2D1RenderTarget,
+    base: &RectF,
+    bitmap: Option<&ID2D1Bitmap>,
+) -> Result<()> {
+    draw_soft_shadow(
+        factory,
+        &mut ctx.tiles,
+        rt,
+        to_d2d(base),
+        RADIUS_CARD,
+        SHADOW_L1.0,
+        SHADOW_L1.1,
+        SHADOW_L1.2,
+        rt.dpi_scale(),
+    )?;
+    fill_smooth_rect(factory, &mut ctx.geo, rt, to_d2d(base), RADIUS_CARD, ctx.pal.get(INPUT)?)?;
+    draw_smooth_rect(factory, &mut ctx.geo, rt, to_d2d(base), RADIUS_CARD, ctx.pal.get(BORDER)?, 1.0)?;
+    let inner = RectF {
+        x: base.x + (base.w - 40.0) / 2.0,
+        y: base.y + (base.h - 40.0) / 2.0,
+        w: 40.0,
+        h: 40.0,
+    };
+    if let Some(bmp) = bitmap {
+        // SAFETY: 位图由调用方缓存持有，绘制期间有效。
+        unsafe {
+            rt.DrawBitmap(
+                bmp,
+                Some(&D2D_RECT_F {
+                    left: inner.x,
+                    top: inner.y,
+                    right: inner.right(),
+                    bottom: inner.bottom(),
+                }),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            )
+        };
+    } else {
+        fill_smooth_rect(factory, &mut ctx.geo, rt, to_d2d(&inner), RADIUS_ITEM, ctx.pal.get(BORDER)?)?;
+    }
+    Ok(())
 }
 
 /// 图标视图格子的状态底：与应用格一致（悬停白底 + L2 阴影，选中浅蓝底 + 1px 主色边）。

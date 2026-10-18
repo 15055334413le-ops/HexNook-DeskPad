@@ -3,10 +3,17 @@
 //! 不创建任何可见窗口、不占单实例锁：在主显示器上按真实数据排版并渲染启动台一帧，
 //! 叠在示意桌面色 + 背景幕上，写成 32 位 BMP。
 use crate::app::{with_app, App};
+use deskpad_engine::{IconStyle, PadSize, VisualStyle};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
 
-pub fn run(out: &str, query: &str) -> bool {
+pub fn run(
+    out: &str,
+    query: &str,
+    style: Option<&str>,
+    size: Option<&str>,
+    icons: Option<&str>,
+) -> bool {
     // 等引擎数据就绪（最多 8 秒）：应用列表 + 文件夹 + 图标基本补齐
     let start = std::time::Instant::now();
     loop {
@@ -21,7 +28,41 @@ pub fn run(out: &str, query: &str) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    with_app(|a| render(a, out, query)).unwrap_or(false)
+    with_app(|a| apply_overrides(a, style, size, icons).is_some_and(|_| render(a, out, query)))
+        .unwrap_or(false)
+}
+
+fn apply_overrides(
+    a: &mut App,
+    style: Option<&str>,
+    size: Option<&str>,
+    icons: Option<&str>,
+) -> Option<()> {
+    a.settings = a.eng.settings();
+    if let Some(style) = style {
+        a.settings.visual_style = match style {
+            "flat" => VisualStyle::Flat,
+            "glass" => VisualStyle::Glass,
+            _ => return None,
+        };
+    }
+    if let Some(size) = size {
+        a.settings.pad_size = match size {
+            "window" => PadSize::Window,
+            "full" => PadSize::Fullscreen,
+            _ => return None,
+        };
+    }
+    if let Some(icons) = icons {
+        a.settings.icon_style = match icons {
+            "native" => IconStyle::Native,
+            "unified" => IconStyle::Unified,
+            _ => return None,
+        };
+    }
+    // 无头截图不创建真实 DWM 背景幕；按所选样式完整展示面板材质。
+    a.glass_active = a.settings.visual_style == VisualStyle::Glass;
+    Some(())
 }
 
 fn render(a: &mut App, out: &str, query: &str) -> bool {
@@ -44,9 +85,9 @@ fn render(a: &mut App, out: &str, query: &str) -> bool {
     crate::win::log_mem("shot:after-draw");
     let (w, h) = a.pad_surface.size;
     let Some(px) = a.pad_surface.pixels() else { return false };
-    // 合成：示意桌面色 → 背景幕 rgba(15,18,26,0.30) → 内容（预乘 BGRA）
+    // 合成：示意桌面色 → 背景幕（Flat 深色遮罩 / Glass 无遮罩，透出桌面）→ 内容（预乘 BGRA）
     let desk = [0x8Bu32, 0x7B, 0x6E]; // B,G,R
-    let scrim = [26u32, 18, 15];
+    let scrim = if a.glass_active { desk } else { [26u32, 18, 15] };
     let mut img = vec![0u8; (w * h * 4) as usize];
     for i in 0..(w * h) as usize {
         let sa = px[i * 4 + 3] as u32;

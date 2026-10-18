@@ -43,6 +43,42 @@ fn fatal(msg: &str) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RenderMode {
+    None,
+    Launcher { out: String },
+    Settings { section: String, out: Option<String> },
+}
+
+impl RenderMode {
+    fn is_render(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+}
+
+fn render_mode(args: &[String]) -> std::result::Result<RenderMode, String> {
+    if let Some(section) = flag_value(args, "--settings") {
+        return Ok(RenderMode::Settings {
+            section,
+            out: flag_value(args, "--out"),
+        });
+    }
+    if args.iter().any(|a| a == "--render-test") {
+        let out = flag_value(args, "--render-test")
+            .ok_or_else(|| "--render-test 需要输出路径".to_string())?;
+        return Ok(RenderMode::Launcher { out });
+    }
+    Ok(RenderMode::None)
+}
+
 fn main() {
     // 0. (a) PDF 缩略图一次性子进程：渲染完就退出，不建窗口、不碰单实例锁（engine docthumb.rs）
     let argv: Vec<String> = std::env::args().collect();
@@ -76,9 +112,15 @@ fn main() {
     // 开发自检：--render-test <out.bmp> [--query <q>]（不建可见窗口、不占单实例锁）
     let args: Vec<String> = std::env::args().collect();
     let arg_after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
-    let render_test = arg_after("--render-test");
+    let render_mode = match render_mode(&args) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     // 4. 单实例；已有实例 → 唤起它的启动台后退出（5-#17）
-    let guard = match if render_test.is_some() { Ok(None) } else { deskpad_engine::single::acquire().map(Some) } {
+    let guard = match if render_mode.is_render() { Ok(None) } else { deskpad_engine::single::acquire().map(Some) } {
         Ok(g) => g,
         Err(EngineError::AlreadyRunning) => {
             // SAFETY: 常量参数。
@@ -106,6 +148,7 @@ fn main() {
             return;
         }
     };
+    let settings = eng.settings();
     // 6. D2D / DWrite 工厂（进程内单份；WIC 在 RenderCtx 里按需创建）
     // SAFETY: 标准 COM 工厂创建，接口泛型与类型一致。
     let factory = match unsafe { D2D1CreateFactory::<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) } {
@@ -136,8 +179,11 @@ fn main() {
         }
     };
     // 8. 全局状态
+    let scrim_brush = win::HBrushGuard::solid(COLORREF(0x001A120F));
+    pad::set_scrim_brush(scrim_brush.0);
     set_app(App {
         eng: eng.clone(),
+        settings,
         main,
         scrim: HWND::default(),
         pad: HWND::default(),
@@ -152,6 +198,8 @@ fn main() {
         pad_surface: surface::Surface::new(),
         pad_ctx: None,
         scrim_origin: (0, 0),
+        _scrim_brush: scrim_brush,
+        glass_active: false,
         ime_pos: (0, 0),
         snap: eng.snapshot(),
         input: input::State::new(),
@@ -168,16 +216,43 @@ fn main() {
         anim: None,
         corner_pos: None,
         error: None,
+        context_menu_open: false,
+        pending_drop: None,
+        drop_highlight: None,
         quitting: false,
         update: UpdateState::Unknown,
         tz_offset: 0,
         now_local: fmt::LocalNow { year: 2026, month: 1, day: 1, hour: 0, minute: 0 },
     });
-    if let Some(out) = render_test {
-        let q = arg_after("--query").unwrap_or_default();
-        let ok = shot::run(&out, &q);
-        eng.shutdown();
-        std::process::exit(if ok { 0 } else { 1 });
+    match &render_mode {
+        RenderMode::Launcher { out } => {
+            let q = arg_after("--query").unwrap_or_default();
+            let ok = shot::run(
+                out,
+                &q,
+                arg_after("--style").as_deref(),
+                arg_after("--size").as_deref(),
+                arg_after("--icons").as_deref(),
+            );
+            eng.shutdown();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        RenderMode::Settings { section, out } => {
+            let Some(section) = settings_ui::Section::parse(section) else {
+                eprintln!("unknown settings section: {section}");
+                eng.shutdown();
+                std::process::exit(2);
+            };
+            let out = out
+                .clone()
+                .unwrap_or_else(|| format!("tools/settings-{}.png", section.slug()));
+            let r = settings_ui::render_shot(section, 1.5).and_then(|png| {
+                std::fs::write(&out, &png).map_err(windows::core::Error::from)
+            });
+            eng.shutdown();
+            std::process::exit(if r.is_ok() { 0 } else { 1 });
+        }
+        RenderMode::None => {}
     }
     // 9. 引擎回调 → PostMessage 回主线程
     deskpad_engine::log::info(&format!("showpad_msg={:x} taskbar_msg={:x}", app::msg_showpad(), app::msg_taskbar_created()));
@@ -225,4 +300,26 @@ fn main() {
     eng.shutdown();
     drop(guard);
     drop(com);
+}
+
+#[cfg(test)]
+mod render_cli_tests {
+    use super::*;
+
+    #[test]
+    fn render_test_settings_selects_settings_mode() {
+        let args = vec![
+            "DeskPad.exe".to_string(),
+            "--render-test".to_string(),
+            "--settings".to_string(),
+            "general".to_string(),
+        ];
+        assert_eq!(
+            render_mode(&args),
+            Ok(RenderMode::Settings {
+                section: "general".to_string(),
+                out: None,
+            })
+        );
+    }
 }

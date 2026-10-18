@@ -7,8 +7,15 @@ use crate::layout::{Hit, RectF};
 use crate::render::{draw_pad, RenderCtx};
 use crate::theme::SHADOW_MARGIN;
 use crate::win;
+use deskpad_engine::{LaunchTarget, VisualStyle};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::core::{w, Result};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_NONE,
+    DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+};
+use windows::Win32::Graphics::Gdi::{FillRect, HBRUSH, HDC};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTimeAsFileTime};
@@ -16,20 +23,103 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+    DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
+    SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+    QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const ANIM_TIMER: usize = 1;
 pub const CARET_TIMER: usize = 2;
+pub const DROP_TIMER: usize = 3;
+
+static SCRIM_GLASS: AtomicBool = AtomicBool::new(false);
+static SCRIM_BRUSH_RAW: AtomicIsize = AtomicIsize::new(0);
+
+pub fn set_scrim_brush(hbrush: HBRUSH) {
+    SCRIM_BRUSH_RAW.store(hbrush.0 as isize, Ordering::Relaxed);
+}
+
+fn set_scrim_layered(app: &App, layered: bool) {
+    // SAFETY: 仅修改本进程窗口的扩展样式；随后用 FRAMECHANGED 让系统重算合成。
+    unsafe {
+        let raw = GetWindowLongPtrW(app.scrim, GWL_EXSTYLE) as u32;
+        let mut ex = WINDOW_EX_STYLE(raw);
+        if layered {
+            ex |= WS_EX_LAYERED;
+        } else {
+            ex.0 &= !WS_EX_LAYERED.0;
+        }
+        let _ = SetWindowLongPtrW(app.scrim, GWL_EXSTYLE, ex.0 as isize);
+        let _ = SetWindowPos(
+            app.scrim,
+            HWND::default(),
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+fn disable_dwm_backdrop(app: &App) {
+    let none = DWMSBT_NONE.0;
+    let margins = MARGINS::default();
+    // SAFETY: 参数结构与长度匹配；失败时保持普通窗口行为。
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            app.scrim,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &none as *const _ as *const _,
+            std::mem::size_of_val(&none) as u32,
+        );
+        let _ = DwmExtendFrameIntoClientArea(app.scrim, &margins);
+    }
+}
+
+/// Flat 保持原分层深色遮罩；Glass 先切到非分层窗口，再启用 Win11 系统背景材料。
+/// 任一 DWM 调用失败时静默回到 Flat，不把半透明内容叠在普通桌面上。
+fn configure_scrim(app: &mut App) {
+    if app.settings.visual_style == VisualStyle::Flat {
+        disable_dwm_backdrop(app);
+        set_scrim_layered(app, true);
+        app.glass_active = false;
+        SCRIM_GLASS.store(false, Ordering::Relaxed);
+        return;
+    }
+
+    set_scrim_layered(app, false);
+    let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+    let backdrop = DWMSBT_TRANSIENTWINDOW.0;
+    // SAFETY: 窗口有效；属性值与长度匹配，失败会走 Flat 回退。
+    let ok = (|| -> Result<()> {
+        unsafe {
+            DwmExtendFrameIntoClientArea(app.scrim, &margins)?;
+            DwmSetWindowAttribute(
+                app.scrim,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop as *const _ as *const _,
+                std::mem::size_of_val(&backdrop) as u32,
+            )?;
+        }
+        Ok(())
+    })()
+    .is_ok();
+    app.glass_active = ok;
+    if !ok {
+        disable_dwm_backdrop(app);
+        set_scrim_layered(app, true);
+        deskpad_engine::log::info("glass backdrop unavailable; flat fallback");
+    }
+    SCRIM_GLASS.store(ok, Ordering::Relaxed);
+}
 /// 切换「最近文件 / 常用文件夹」的列表或图标视图：保存设置并按新视图重排。
 fn set_view(app: &mut App, zone: crate::layout::FocusZone, mode: crate::layout::ViewMode) {
     use crate::layout::FocusZone;
-    let mut s = app.eng.settings();
+    let mut s = app.settings.clone();
     match zone {
         FocusZone::Files if s.files_view != mode => s.files_view = mode,
         FocusZone::Dirs if s.dirs_view != mode => s.dirs_view = mode,
@@ -38,7 +128,14 @@ fn set_view(app: &mut App, zone: crate::layout::FocusZone, mode: crate::layout::
     if let Err(e) = app.eng.save_settings(&s) {
         deskpad_engine::log::warn(&format!("save view mode: {e:?}"));
     }
-    app.layout = crate::layout::compute(app.layout.work, s.max_recent as usize, app.snap.dirs.len(), (s.files_view, s.dirs_view));
+    app.settings = s.clone();
+    app.layout = crate::layout::compute_with(
+        app.layout.work,
+        s.max_recent as usize,
+        app.snap.dirs.len(),
+        (s.files_view, s.dirs_view),
+        s.pad_size,
+    );
     if app.input.focus == zone {
         app.input.selected = Some(0);
     }
@@ -57,12 +154,8 @@ pub fn fullscreen_ignores_hotkey() -> bool {
 }
 
 pub fn create_windows() -> Result<()> {
-    // 类背景刷必须与类同寿命，故意泄漏（scrim 每次 WM_ERASEBKGND 都会用它）。
-    // 之前画刷创建了却没传给窗口类，背景幕整窗是空的——这就是截图里「没有深色遮罩」的原因。
-    let brush = win::HBrushGuard::solid(COLORREF(0x001A120F)); // RGB(15,18,26)
-    let hbr = brush.0;
-    std::mem::forget(brush);
-    win::register_class(w!("DeskPadScrim"), Some(scrim_proc), Some(hbr))?;
+    // 背景由 WM_ERASEBKGND 按主题绘制：Flat 填深色，Glass 保持透明让 DWM 背景材料透出。
+    win::register_class(w!("DeskPadScrim"), Some(scrim_proc), None)?;
     win::register_class(w!("DeskPadPad"), Some(pad_proc), None)?;
     let main = with_app(|a| a.main).unwrap_or_default();
     let ex_scrim = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
@@ -72,6 +165,8 @@ pub fn create_windows() -> Result<()> {
         w!("DeskPadPad"), w!(""), WS_POPUP,
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         Some(scrim), 0, 0, 0, 0)?;
+    // SAFETY: 内容窗口由本进程持有；拖放由 WM_DROPFILES 在主线程处理。
+    unsafe { DragAcceptFiles(pad, true); }
     with_app(|a| {
         a.scrim = scrim;
         a.pad = pad;
@@ -91,6 +186,8 @@ pub fn show(app: &mut App, reason: ShowReason) {
     // hide() 的 early-return，把全屏遮罩永久留在屏幕上吃掉所有鼠标输入
     app.pad_visible = true;
     let _ = reason;
+    app.settings = app.eng.settings();
+    configure_scrim(app);
     // 5-#2：记下呼出前的前台窗口
     // SAFETY: 查询前台窗口；失败时无前台可还。
     let fg = unsafe { GetForegroundWindow() };
@@ -148,13 +245,13 @@ pub fn show(app: &mut App, reason: ShowReason) {
     if app.anim.is_none() {
         // 系统动画关闭：直接到终态
         app.pad_alpha = 255;
-        app.scrim_alpha = 77;
+        app.scrim_alpha = if app.glass_active { 0 } else { 77 };
         let _ = app.pad_surface.set_alpha_and_pos(
             app.pad,
             POINT { x: app.pad_origin.0, y: app.pad_origin.1 },
             255,
         );
-        set_scrim_alpha(app, 77);
+        set_scrim_alpha(app, app.scrim_alpha);
     }
     // 5-#15/6.10：启动台被打开时，引导气泡消失
     crate::corner::dismiss_bubble(app, true);
@@ -186,7 +283,7 @@ pub fn prepare_frame(app: &mut App, mon: windows::Win32::Graphics::Gdi::HMONITOR
     app.work = work;
     app.now_local = local_now();
     app.tz_offset = tz_offset_sec();
-    let s = app.eng.settings();
+    let s = app.settings.clone();
     let scale = app.scale();
     let work_dip = RectF {
         x: work.left as f32 / scale,
@@ -194,7 +291,13 @@ pub fn prepare_frame(app: &mut App, mon: windows::Win32::Graphics::Gdi::HMONITOR
         w: (work.right - work.left) as f32 / scale,
         h: (work.bottom - work.top) as f32 / scale,
     };
-    app.layout = crate::layout::compute(work_dip, s.max_recent as usize, app.snap.dirs.len(), (s.files_view, s.dirs_view));
+    app.layout = crate::layout::compute_with(
+        work_dip,
+        s.max_recent as usize,
+        app.snap.dirs.len(),
+        (s.files_view, s.dirs_view),
+        s.pad_size,
+    );
     // 内容窗口物理矩形（面板外接矩形向外扩 SHADOW_MARGIN）
     let ox = ((app.layout.content.x - SHADOW_MARGIN) * scale).round() as i32;
     let oy = ((app.layout.content.y - SHADOW_MARGIN) * scale).round() as i32;
@@ -248,7 +351,16 @@ pub fn prepare_frame(app: &mut App, mon: windows::Win32::Graphics::Gdi::HMONITOR
 /// 整帧重绘并推屏。
 pub fn render_frame(app: &mut App) -> Result<()> {
     let pf = pad_factory(app);
+    let old_size = app.pad_surface.size;
     app.pad_surface.ensure(&pf, app.pad_size.0, app.pad_size.1, app.dpi as f32)?;
+    if old_size != app.pad_surface.size {
+        app.pad_ctx = None;
+    }
+    if app.pad_ctx.is_none() {
+        if let Some(rt) = app.pad_surface.rt().cloned() {
+            app.pad_ctx = RenderCtx::new(&pad_factory(app), &pad_dwrite(app), rt).ok();
+        }
+    }
     if let Some(mut ctx) = app.pad_ctx.take() {
         let factory = pad_factory(app);
         let r = draw_pad(app, &mut ctx, &factory);
@@ -265,6 +377,9 @@ pub fn render_frame(app: &mut App) -> Result<()> {
 
 /// 背景幕整窗透明度（背景幕只用 SetLayeredWindowAttributes，零位图）。
 pub fn set_scrim_alpha(app: &App, alpha: u8) {
+    if app.glass_active {
+        return;
+    }
     // SAFETY: 窗口句柄有效；LWA_ALPHA 语义。
     unsafe {
         let _ = SetLayeredWindowAttributes(app.scrim, COLORREF(0), alpha, LWA_ALPHA);
@@ -282,6 +397,18 @@ fn on_timer(app: &mut App, id: usize) {
         CARET_TIMER => {
             app.caret_on = !app.caret_on;
             let _ = render_frame(app);
+        }
+        DROP_TIMER => {
+            let expired = app
+                .drop_highlight
+                .as_ref()
+                .is_none_or(|(_, until)| *until <= std::time::Instant::now());
+            if expired {
+                app.drop_highlight = None;
+                // SAFETY: 与拖入时的 SetTimer 配对。
+                unsafe { let _ = KillTimer(app.pad, DROP_TIMER); }
+                let _ = render_frame(app);
+            }
         }
         _ => {}
     }
@@ -309,6 +436,197 @@ fn exec_action(app: &mut App, act: Action) -> bool {
             Ok(()) => { hide(app, HideReason::Launch); false }
             Err(e) => { app.error = Some((fmt::error_text(&e), std::time::Instant::now())); true }
         },
+    }
+}
+
+fn app_file_path(entry: &deskpad_engine::AppEntry) -> Option<std::path::PathBuf> {
+    match &entry.launch {
+        LaunchTarget::Shortcut(path) => Some(path.clone()),
+        LaunchTarget::AppsFolder(parsing) => {
+            let path = std::path::PathBuf::from(parsing);
+            path.is_absolute().then_some(path)
+        }
+    }
+}
+
+fn elevation_target(entry: &deskpad_engine::AppEntry) -> Option<std::path::PathBuf> {
+    let path = app_file_path(entry)?;
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    matches!(ext.as_str(), "exe" | "lnk").then_some(path)
+}
+
+fn shell_result_ok(result: HINSTANCE) -> bool {
+    result.0 as isize > 32
+}
+
+fn run_elevated(app: &App, path: &std::path::Path) -> bool {
+    let file = windows::core::HSTRING::from(path.to_string_lossy().as_ref());
+    // SAFETY: 字符串由 HSTRING 持有，调用期间有效。
+    let result = unsafe {
+        ShellExecuteW(
+            app.pad,
+            w!("runas"),
+            &file,
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    shell_result_ok(result)
+}
+
+fn open_file_location(app: &App, entry: &deskpad_engine::AppEntry) -> bool {
+    if let Some(path) = app_file_path(entry).filter(|p| p.exists()) {
+        let verb = windows::core::HSTRING::from("open");
+        let exe = windows::core::HSTRING::from("explorer.exe");
+        let args = windows::core::HSTRING::from(format!("/select,\"{}\"", path.display()));
+        // SAFETY: 三个 HSTRING 在调用期间有效。
+        let result = unsafe {
+            ShellExecuteW(
+                app.pad,
+                &verb,
+                &exe,
+                &args,
+                windows::core::PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        return shell_result_ok(result);
+    }
+    let verb = windows::core::HSTRING::from("open");
+    let exe = windows::core::HSTRING::from("explorer.exe");
+    let args = windows::core::HSTRING::from("shell:AppsFolder");
+    // SAFETY: 三个 HSTRING 在调用期间有效。
+    let result = unsafe {
+        ShellExecuteW(
+            app.pad,
+            &verb,
+            &exe,
+            &args,
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    shell_result_ok(result)
+}
+
+fn show_app_context_menu(app: &mut App, hit_idx: usize, screen: POINT) {
+    const CMD_OPEN: usize = 1;
+    const CMD_RUNAS: usize = 2;
+    const CMD_LOCATION: usize = 3;
+    const CMD_HIDE: usize = 4;
+
+    let Some(entry) = app
+        .input
+        .hits
+        .get(hit_idx)
+        .and_then(|&i| app.snap.apps.get(i))
+        .cloned()
+    else {
+        return;
+    };
+    // SAFETY: 菜单句柄由 HMenuGuard 管理。
+    let menu = unsafe { CreatePopupMenu() }.unwrap_or_default();
+    if menu.is_invalid() {
+        return;
+    }
+    let _guard = win::HMenuGuard(menu);
+    let can_elevate = elevation_target(&entry).is_some();
+    let can_hide = !entry.setting_id.is_empty();
+    // SAFETY: 菜单有效，文本均为静态宽字符字面量。
+    unsafe {
+        let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, w!("打开"));
+        if can_elevate {
+            let _ = AppendMenuW(menu, MF_STRING, CMD_RUNAS, w!("以管理员身份运行"));
+        }
+        let _ = AppendMenuW(menu, MF_STRING, CMD_LOCATION, w!("打开文件位置"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | if can_hide { MF_ENABLED } else { MF_GRAYED },
+            CMD_HIDE,
+            w!("隐藏"),
+        );
+    }
+
+    app.context_menu_open = true;
+    // SAFETY: 菜单弹出的标准流程；返回命令后向窗口投 WM_NULL 让系统清理菜单状态。
+    let cmd = unsafe {
+        let _ = SetForegroundWindow(app.pad);
+        let cmd = TrackPopupMenuEx(
+            menu,
+            (TPM_RIGHTBUTTON | TPM_RETURNCMD).0,
+            screen.x,
+            screen.y,
+            app.pad,
+            None,
+        );
+        let _ = PostMessageW(app.pad, WM_NULL, WPARAM(0), LPARAM(0));
+        cmd.0 as usize
+    };
+    app.context_menu_open = false;
+
+    match cmd {
+        CMD_OPEN => {
+            exec_action(app, Action::Launch(hit_idx));
+        }
+        CMD_RUNAS => {
+            if let Some(path) = elevation_target(&entry) {
+                if run_elevated(app, &path) {
+                    hide(app, HideReason::Launch);
+                } else {
+                    app.error = Some(("无法以管理员身份运行这个应用".into(), std::time::Instant::now()));
+                }
+            }
+        }
+        CMD_LOCATION => {
+            if open_file_location(app, &entry) {
+                hide(app, HideReason::Launch);
+            } else {
+                app.error = Some(("无法打开文件位置".into(), std::time::Instant::now()));
+            }
+        }
+        CMD_HIDE => {
+            if let Err(e) = app.eng.set_hidden(&entry.setting_id, true) {
+                app.error = Some((fmt::error_text(&e), std::time::Instant::now()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn supported_drop(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|ext| matches!(ext.to_string_lossy().to_lowercase().as_str(), "exe" | "lnk" | "url"))
+        .unwrap_or(false)
+}
+
+fn handle_dropped_paths(app: &mut App, paths: Vec<std::path::PathBuf>) {
+    let supported: Vec<_> = paths.into_iter().filter(|p| supported_drop(p)).collect();
+    if supported.is_empty() {
+        app.error = Some(("仅支持拖入 .exe、.lnk 或 .url 文件".into(), std::time::Instant::now()));
+        return;
+    }
+    let mut added = None;
+    let mut last_error = None;
+    for path in supported {
+        match app.eng.add_manual_app(&path) {
+            Ok(()) => added = Some(path),
+            Err(e) => {
+                deskpad_engine::log::warn(&format!("drop add {}: {e:?}", path.display()));
+                last_error = Some(fmt::error_text(&e));
+            }
+        }
+    }
+    if let Some(path) = added {
+        app.pending_drop = Some(path);
+        app.input.query.clear();
+        app.input.focus = crate::layout::FocusZone::Apps;
+        app.input.selected = Some(0);
+        app.input.scroll_row = 0;
+        app.error = None;
+    } else if let Some(error) = last_error {
+        app.error = Some((error, std::time::Instant::now()));
     }
 }
 
@@ -393,6 +711,18 @@ pub unsafe extern "system" fn scrim_proc(
 ) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => LRESULT(3), // MA_NOACTIVATE
+        WM_ERASEBKGND => {
+            if SCRIM_GLASS.load(Ordering::Relaxed) {
+                return LRESULT(1);
+            }
+            let raw = SCRIM_BRUSH_RAW.load(Ordering::Relaxed);
+            if raw != 0 {
+                let rect = RECT { left: 0, top: 0, right: 1 << 30, bottom: 1 << 30 };
+                // SAFETY: HDC/HBRUSH 由系统消息与本进程持有；FillRect 会按窗口裁剪。
+                FillRect(HDC(wparam.0 as *mut _), &rect, HBRUSH(raw as *mut _));
+            }
+            LRESULT(1)
+        }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             with_app(|a| hide(a, HideReason::ClickOutside));
             LRESULT(0)
@@ -466,6 +796,32 @@ pub unsafe extern "system" fn pad_proc(
             });
             LRESULT(0)
         }
+        WM_RBUTTONUP => {
+            with_app(|a| {
+                let x = win::get_x_lparam(lparam);
+                let y = win::get_y_lparam(lparam);
+                let pt = client_to_layout(a, x, y);
+                let hit = a.layout.hit_test(
+                    pt,
+                    a.input.scroll_row,
+                    a.input.hits.len(),
+                    a.snap.recent.len(),
+                    a.snap.dirs.len(),
+                );
+                if let Hit::App(i) = hit {
+                    a.input.focus = crate::layout::FocusZone::Apps;
+                    a.input.selected = Some(i);
+                    let mut screen = POINT::default();
+                    // SAFETY: 输出参数由本栈帧持有。
+                    unsafe { let _ = GetCursorPos(&mut screen); }
+                    show_app_context_menu(a, i, screen);
+                    if a.pad_visible {
+                        let _ = render_frame(a);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             with_app(|a| {
                 let x = win::get_x_lparam(lparam);
@@ -504,11 +860,34 @@ pub unsafe extern "system" fn pad_proc(
             if state == 0 {
                 // WA_INACTIVE
                 with_app(|a| {
-                    if a.pad_visible {
+                    if a.pad_visible && !a.context_menu_open {
                         hide(a, HideReason::Deactivate);
                     }
                 });
             }
+            LRESULT(0)
+        }
+        WM_DROPFILES => {
+            let hdrop = HDROP(wparam.0 as *mut _);
+            // SAFETY: HDROP 由当前 WM_DROPFILES 消息持有，只读查询文件总数。
+            let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+            let mut paths = Vec::new();
+            for i in 0..count {
+                // SAFETY: 同上，只读查询第 i 个路径的字符数。
+                let len = unsafe { DragQueryFileW(hdrop, i, None) } as usize;
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len + 1];
+                // SAFETY: buf 长度 = len + 1，满足 DragQueryFileW 的写入上限。
+                let got = unsafe { DragQueryFileW(hdrop, i, Some(&mut buf)) } as usize;
+                if got > 0 {
+                    paths.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..got])));
+                }
+            }
+            // SAFETY: HDROP 由当前 WM_DROPFILES 消息持有，且只释放一次。
+            unsafe { DragFinish(hdrop); }
+            with_app(|a| handle_dropped_paths(a, paths));
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -572,6 +951,7 @@ pub fn hide(app: &mut App, reason: HideReason) {
     // SAFETY: 光标闪烁定时器停掉；ANIM 定时器由关闭动画自行管理。
     unsafe {
         let _ = KillTimer(app.pad, CARET_TIMER);
+        let _ = KillTimer(app.pad, DROP_TIMER);
     }
     if reason == HideReason::Launch {
         finalize_hide(app, reason);
@@ -632,7 +1012,23 @@ pub fn on_snapshot(app: &mut App) {
         .and_then(|i| app.input.hits.get(i).copied())
         .and_then(|idx| app.snap.apps.get(idx))
         .map(|a| a.id);
+    app.settings = app.eng.settings();
     app.snap = app.eng.snapshot();
+    if let Some(path) = app.pending_drop.clone() {
+        if let Some(id) = app.snap.apps.iter().find_map(|entry| {
+            let same = matches!(&entry.launch, LaunchTarget::Shortcut(p)
+                if p.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy()));
+            same.then_some(entry.id)
+        }) {
+            app.pending_drop = None;
+            app.drop_highlight = Some((
+                id,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ));
+            // SAFETY: 定时器挂在内容窗口；到点后由 on_timer 清理。
+            unsafe { let _ = SetTimer(app.pad, DROP_TIMER, 1000, None); }
+        }
+    }
     app.input.hits = app.eng.search(&app.snap, &app.input.query);
     app.input.selected = sel_app_id
         .and_then(|id| {
@@ -646,6 +1042,29 @@ pub fn on_snapshot(app: &mut App) {
         ctx.icons.prune(&app.snap);
     }
     if app.pad_visible {
+        let scale = app.scale();
+        let work = app.work;
+        let work_dip = RectF {
+            x: work.left as f32 / scale,
+            y: work.top as f32 / scale,
+            w: (work.right - work.left) as f32 / scale,
+            h: (work.bottom - work.top) as f32 / scale,
+        };
+        app.layout = crate::layout::compute_with(
+            work_dip,
+            app.settings.max_recent as usize,
+            app.snap.dirs.len(),
+            (app.settings.files_view, app.settings.dirs_view),
+            app.settings.pad_size,
+        );
+        app.pad_origin = (
+            ((app.layout.content.x - SHADOW_MARGIN) * scale).round() as i32,
+            ((app.layout.content.y - SHADOW_MARGIN) * scale).round() as i32,
+        );
+        app.pad_size = (
+            ((app.layout.content.w + 2.0 * SHADOW_MARGIN) * scale).round() as i32,
+            ((app.layout.content.h + 2.0 * SHADOW_MARGIN) * scale).round() as i32,
+        );
         let _ = render_frame(app);
     }
 }
@@ -696,5 +1115,54 @@ fn pad_dwrite(app: &mut App) -> windows::Win32::Graphics::DirectWrite::IDWriteFa
             f
         }
         Err(_) => app.dwrite.clone(),
+    }
+}
+
+#[cfg(test)]
+mod t {
+    use super::*;
+    use deskpad_engine::{AppEntry, AppSource, SearchKeys};
+
+    fn entry(launch: LaunchTarget) -> AppEntry {
+        AppEntry {
+            id: 1,
+            name: "test".into(),
+            launch,
+            icon_png: None,
+            source: AppSource::Manual,
+            keys: SearchKeys::default(),
+            is_system: false,
+            hidden: false,
+            setting_id: "test".into(),
+        }
+    }
+
+    #[test]
+    fn elevation_is_limited_to_exe_and_lnk() {
+        assert!(elevation_target(&entry(LaunchTarget::Shortcut(
+            std::path::PathBuf::from(r"C:\Tools\Editor.EXE")
+        )))
+        .is_some());
+        assert!(elevation_target(&entry(LaunchTarget::Shortcut(
+            std::path::PathBuf::from(r"C:\Tools\Editor.lnk")
+        )))
+        .is_some());
+        assert!(elevation_target(&entry(LaunchTarget::Shortcut(
+            std::path::PathBuf::from(r"C:\Tools\notes.txt")
+        )))
+        .is_none());
+        assert!(elevation_target(&entry(LaunchTarget::AppsFolder(
+            "Some.Vendor_App!App".into()
+        )))
+        .is_none());
+    }
+
+    #[test]
+    fn drop_filter_accepts_only_card_extensions() {
+        assert!(supported_drop(std::path::Path::new("a.exe")));
+        assert!(supported_drop(std::path::Path::new("a.LNK")));
+        assert!(supported_drop(std::path::Path::new("a.url")));
+        assert!(!supported_drop(std::path::Path::new("a.txt")));
+        assert!(!supported_drop(std::path::Path::new("no_extension")));
     }
 }

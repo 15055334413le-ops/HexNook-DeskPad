@@ -1,6 +1,8 @@
 //! 全局状态 App（单例，只在 UI 线程访问）+ 消息常量（UI 文档 2/app.rs）。
-use deskpad_engine::{EngineHandle, Snapshot};
+use deskpad_engine::{AppId, EngineHandle, Settings, Snapshot};
 use std::cell::RefCell;
+use std::path::PathBuf;
+use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 use windows::Win32::Foundation::WPARAM;
@@ -55,6 +57,8 @@ pub enum HideReason {
 
 pub struct App {
     pub eng: EngineHandle,
+    /// 启动台使用的设置快照；设置窗口保存后由快照/显示流程刷新。
+    pub settings: Settings,
     pub main: HWND,
     /// 启动台背景幕窗口。
     pub scrim: HWND,
@@ -84,6 +88,10 @@ pub struct App {
     /// 背景幕窗口左上角（物理像素）。
     #[allow(dead_code)] // 遮罩不位移，预留
     pub scrim_origin: (i32, i32),
+    /// 背景幕 GDI 画刷（Flat / Glass 回退时使用）。
+    pub _scrim_brush: crate::win::HBrushGuard,
+    /// DWM 系统背景材料是否成功启用；失败时渲染整体退回 Flat。
+    pub glass_active: bool,
     /// IME 候选窗位置（内容窗口客户区物理像素）。
     pub ime_pos: (i32, i32),
     pub snap: Snapshot,
@@ -109,6 +117,12 @@ pub struct App {
     pub corner_pos: Option<(i32, i32)>,
     /// 错误条（文案 + 出现时间），3 秒后消失。
     pub error: Option<(String, std::time::Instant)>,
+    /// 应用右键菜单显示期间禁止失活隐藏。
+    pub context_menu_open: bool,
+    /// 拖入后等待 Snapshot 出现的新路径；出现后转为 1 秒高亮。
+    pub pending_drop: Option<PathBuf>,
+    /// 拖入新项的高亮截止时间。
+    pub drop_highlight: Option<(AppId, Instant)>,
     /// 已退出标志（防止 PostQuitMessage 后重复清理）。
     pub quitting: bool,
     /// 更新状态（齿轮角标 / 托盘菜单 / 设置窗口三处共用）。

@@ -18,6 +18,8 @@ pub enum LaunchTarget {
 pub enum AppSource {
     StartMenu,
     Desktop,
+    ExtraScanDir,
+    Manual,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -31,6 +33,15 @@ pub struct AppEntry {
     pub source: AppSource,
     /// 引擎内部用于搜索与排序的派生键，UI 不得解析。
     pub keys: SearchKeys,
+    /// 是否为 Windows 管理/维护工具；日常应用不算。
+    #[serde(default)]
+    pub is_system: bool,
+    /// 是否在 settings.hidden_apps 中；只用于 all_apps 的管理视图。
+    #[serde(default)]
+    pub hidden: bool,
+    /// hidden_apps 使用的小写稳定键；扫描时预先计算，避免 UI 线程再访问 COM。
+    #[serde(default)]
+    pub setting_id: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +140,42 @@ pub enum Theme {
     Dark,
 }
 
+/// 启动台主体视觉风格。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VisualStyle {
+    /// 默认的 tofour 扁平风格。
+    #[default]
+    Flat,
+    /// 毛玻璃风格，具体呈现由 UI 后续实现。
+    Glass,
+}
+
+/// 启动台尺寸。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PadSize {
+    #[default]
+    Window,
+    Fullscreen,
+}
+
+/// 应用图标呈现方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IconStyle {
+    #[default]
+    Native,
+    Unified,
+}
+
+/// 启动台应用排序方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortMode {
+    /// 按名称排序。
+    #[default]
+    Name,
+    /// 按 30 天半衰期的启动频率分排序。
+    Frequency,
+}
+
 pub const SETTINGS_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,6 +197,15 @@ pub struct Settings {
     /// 打开启动台时自动检查更新（距上次 ≥24 小时才真正发起；questions.md #35）。
     /// serde default = true，旧 config.json 缺这个字段也能读。
     pub auto_check_update: bool,
+    pub visual_style: VisualStyle,
+    pub pad_size: PadSize,
+    pub icon_style: IconStyle,
+    pub show_system_tools: bool,
+    /// AppsFolder parsing name 或快捷方式目标路径，统一小写。
+    pub hidden_apps: Vec<String>,
+    pub extra_scan_dirs: Vec<PathBuf>,
+    pub manual_apps: Vec<PathBuf>,
+    pub sort_mode: SortMode,
 }
 
 impl Default for Settings {
@@ -164,6 +220,14 @@ impl Default for Settings {
             files_view: ViewMode::Grid,
             dirs_view: ViewMode::Grid,
             auto_check_update: true,
+            visual_style: VisualStyle::Flat,
+            pad_size: PadSize::Window,
+            icon_style: IconStyle::Native,
+            show_system_tools: false,
+            hidden_apps: Vec::new(),
+            extra_scan_dirs: Vec::new(),
+            manual_apps: Vec::new(),
+            sort_mode: SortMode::Name,
         }
     }
 }
@@ -174,6 +238,8 @@ pub struct Snapshot {
     pub generation: u64,
     /// false = 首次扫描尚未完成（UI 显示「正在读取应用…」）。
     pub ready: bool,
+    /// 未过滤的全量应用；被隐藏项带 hidden=true，供设置页管理。
+    pub all_apps: Arc<Vec<AppEntry>>,
     /// 已按 keys.sort_key 升序排列（空查询时的显示顺序）。
     pub apps: Arc<Vec<AppEntry>>,
     /// 已排序：mtime 降序，截断到 settings.max_recent。

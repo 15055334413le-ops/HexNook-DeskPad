@@ -112,15 +112,14 @@ pub(crate) fn fill_missing(
 /// 把一批提取结果写进快照并发布（4.8.2 发布语义）。
 fn apply_icons(inner: &crate::Inner, batch: &HashMap<AppId, PathBuf>) -> bool {
     let mut snap = crate::write_lock(&inner.snap);
-    let apps = std::sync::Arc::make_mut(&mut snap.apps);
     let mut changed = false;
-    for a in apps.iter_mut() {
-        if let Some(p) = batch.get(&a.id) {
-            if a.icon_png.as_deref() != Some(p.as_path()) {
-                a.icon_png = Some(p.clone());
-                changed = true;
-            }
-        }
+    {
+        let apps = std::sync::Arc::make_mut(&mut snap.all_apps);
+        changed |= apply_icon_batch(apps.as_mut_slice(), batch);
+    }
+    {
+        let apps = std::sync::Arc::make_mut(&mut snap.apps);
+        changed |= apply_icon_batch(apps.as_mut_slice(), batch);
     }
     if changed {
         snap.generation += 1;
@@ -128,6 +127,19 @@ fn apply_icons(inner: &crate::Inner, batch: &HashMap<AppId, PathBuf>) -> bool {
     drop(snap);
     if changed {
         crate::fire_on_change(inner);
+    }
+    changed
+}
+
+fn apply_icon_batch(apps: &mut [AppEntry], batch: &HashMap<AppId, PathBuf>) -> bool {
+    let mut changed = false;
+    for app in apps {
+        if let Some(path) = batch.get(&app.id) {
+            if app.icon_png.as_deref() != Some(path.as_path()) {
+                app.icon_png = Some(path.clone());
+                changed = true;
+            }
+        }
     }
     changed
 }

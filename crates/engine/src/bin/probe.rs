@@ -92,26 +92,42 @@ fn cmd_icons() -> Result<(), String> {
     Ok(())
 }
 
-/// probe apps [--ids]：count/ready + 每行 id | 来源 | 名称 | alias | initials | 图标。
+/// probe apps [--ids] [--all]：默认只列出启动台可见应用；--all 含隐藏和系统项。
 fn cmd_apps(args: &[String]) -> Result<(), String> {
     let ids_only = args.iter().any(|a| a == "--ids");
+    let all = args.iter().any(|a| a == "--all");
     let engine = EngineHandle::init().map_err(|e| e.to_string())?;
     let snap = engine.snapshot();
+    let apps = if all { &snap.all_apps } else { &snap.apps };
     if ids_only {
-        for a in snap.apps.iter() {
+        for a in apps.iter() {
             println!("{:016x}", a.id);
         }
     } else {
-        println!("count={} ready={}", snap.apps.len(), snap.ready);
-        for a in snap.apps.iter() {
+        println!("count={} ready={}", apps.len(), snap.ready);
+        for a in apps.iter() {
             let src = match a.source {
                 AppSource::StartMenu => "StartMenu",
                 AppSource::Desktop => "Desktop",
+                AppSource::ExtraScanDir => "ExtraScanDir",
+                AppSource::Manual => "Manual",
             };
             let icon = if a.icon_png.is_some() { "有" } else { "无" };
+            let mut tags = Vec::new();
+            if a.is_system {
+                tags.push("[system]");
+            }
+            if a.hidden {
+                tags.push("[hidden]");
+            }
+            let tags = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", tags.join(" "))
+            };
             println!(
-                "{:016x} | {} | {} | {} | {} | 图标:{}",
-                a.id, src, a.name, a.keys.alias, a.keys.initials, icon
+                "{:016x} | {} | {}{} | {} | {} | 图标:{}",
+                a.id, src, a.name, tags, a.keys.alias, a.keys.initials, icon
             );
         }
     }

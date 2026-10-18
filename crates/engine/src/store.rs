@@ -66,11 +66,11 @@ struct IndexFile {
 pub(crate) fn load_index(dir: &Path) -> Option<Vec<AppEntry>> {
     let text = fs::read_to_string(dir.join("index.json")).ok()?;
     let f: IndexFile = serde_json::from_str(&text).ok()?;
-    Some(f.apps)
+    (f.version >= 2).then_some(f.apps)
 }
 
 pub(crate) fn save_index(dir: &Path, apps: &[AppEntry]) -> Result<(), EngineError> {
-    atomic_write_json(dir, "index.json", &IndexFile { version: 1, apps: apps.to_vec() })
+    atomic_write_json(dir, "index.json", &IndexFile { version: 2, apps: apps.to_vec() })
 }
 
 /// 加载 Settings 后钳制：max_recent 1..=20；version 低于当前值时按迁移表升级（v0.1 无迁移）。
@@ -85,7 +85,7 @@ fn clamp(mut s: Settings) -> Settings {
 fn atomic_write_json<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<(), EngineError> {
     let data = serde_json::to_string_pretty(value)
         .map_err(|e| EngineError::Io(format!("serialize {name}: {e}")))?;
-    let tmp = dir.join(format!("{name}.tmp"));
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     {
         let mut f = fs::File::create(&tmp)
             .map_err(|e| EngineError::Io(format!("create {name}.tmp: {e}")))?;
