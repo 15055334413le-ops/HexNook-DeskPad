@@ -81,11 +81,11 @@ pub fn on_checked() {
 
 /// 把最新状态同步到角标（重绘）和设置窗口（如果开着）。
 fn sync_ui(state: UpdateState) {
-    with_app(|a| {
-        if let Some(sw) = a.settings_wnd {
-            crate::settings_ui::set_update_state(sw, state.clone());
-        }
-    });
+    // 先取出窗口句柄再调用：set_update_state 会重绘，重绘里还要借 App，
+    // 放在 with_app 里面会被重入保护挡掉，设置窗口就一直停在「正在检查…」
+    if let Some(sw) = with_app(|a| a.settings_wnd).flatten() {
+        crate::settings_ui::set_update_state(sw, state.clone());
+    }
     crate::corner::redraw();
 }
 
